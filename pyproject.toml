@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trusted-release"
+version = "1.0.0"
+description = "Offline trusted software artifact registration, signing and verification (stdlib only)"
+requires-python = ">=3.10"
+
+[project.scripts]
+trusted-release = "trusted_release.cli:main"
+
+[tool.setuptools]
+packages = ["trusted_release"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
