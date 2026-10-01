@@ -73,7 +73,20 @@ class Verifier:
         build_spec_path: str | None = None,
         now: str,
         expected_product: str | None = None,
+        evaluation: str = "current",
     ) -> VerificationResult:
+        if release_record.get("type") == "trusted-release/release/v2" or (
+            "approvals" in release_record
+            and "attestation" not in release_record
+        ):
+            return self.verify_release_v2(
+                release_record,
+                artifact_path=artifact_path,
+                build_spec_path=build_spec_path,
+                now=now,
+                expected_product=expected_product,
+                evaluation=evaluation,
+            )
         errors: list[str] = []
         checks: dict = {}
         att = release_record.get("attestation", {})
@@ -275,6 +288,335 @@ class Verifier:
             return None
         return snapshot
 
+    # ---------- multi-approval (v2) releases ----------
+    def verify_release_v2(
+        self,
+        release_record: dict,
+        *,
+        artifact_path: str,
+        build_spec_path: str | None = None,
+        now: str,
+        expected_product: str | None = None,
+        evaluation: str = "current",
+    ) -> VerificationResult:
+        """Verify a multi-signer release under current and/or release-time
+        trust conditions.
+
+        evaluation: "current" (default), "release_time" or "both". The
+        result's ok flag reflects the requested evaluation; the report
+        always contains both evaluations so an offline auditor can compare
+        the conclusion at release time with the conclusion under the
+        current trust conditions. The release record itself is never
+        modified.
+        """
+        errors: list[str] = []
+        checks: dict = {}
+        rid = release_record.get("release_id", "?")
+
+        # ---------- content binding ----------
+        actual_artifact_digest = file_digest(artifact_path)
+        signed_artifact_digest = release_record.get("artifact_digest", "")
+        content_ok = actual_artifact_digest == signed_artifact_digest
+        checks["artifact_digest"] = {
+            "expected": signed_artifact_digest,
+            "actual": actual_artifact_digest,
+            "ok": content_ok,
+        }
+        if not content_ok:
+            errors.append(
+                "artifact content mismatch: presented file does not match "
+                "signed digest (content substituted)"
+            )
+        build_ok = True
+        if build_spec_path is not None:
+            actual_spec_digest = file_digest(build_spec_path)
+            signed_spec_digest = release_record.get("build_spec_digest", "")
+            build_ok = actual_spec_digest == signed_spec_digest
+            checks["build_spec_digest"] = {
+                "expected": signed_spec_digest,
+                "actual": actual_spec_digest,
+                "ok": build_ok,
+            }
+            if not build_ok:
+                errors.append(
+                    "build spec mismatch: presented build spec does not "
+                    "match signed digest"
+                )
+        if expected_product is not None and (
+            release_record.get("product") != expected_product
+        ):
+            errors.append(
+                f"product mismatch: expected {expected_product}, "
+                f"released {release_record.get('product')}"
+            )
+
+        # ---------- trust evaluations ----------
+        evaluations: dict = {}
+        snap = release_record.get("trust_snapshot") or {}
+        evaluations["release_time"] = self._evaluate_approval_set(
+            release_record,
+            now=snap.get("captured_at", release_record.get("issued_at", now)),
+            key_lookup=self._snapshot_key_lookup(snap),
+            crl_snapshot=snap.get("crl_snapshot"),
+        )
+        evaluations["current"] = self._evaluate_approval_set(
+            release_record,
+            now=now,
+            key_lookup=self._current_key_lookup(),
+            crl_snapshot="__current__",
+        )
+        checks["evaluations"] = evaluations
+
+        if evaluation == "release_time":
+            gate = evaluations["release_time"]
+        elif evaluation == "both":
+            gate = {
+                "ok": evaluations["release_time"]["ok"]
+                and evaluations["current"]["ok"]
+            }
+        else:
+            gate = evaluations["current"]
+        for label, ev in evaluations.items():
+            for e in ev["errors"]:
+                errors.append(f"[{label}] {e}")
+        checks["approvals"] = evaluations[
+            "release_time" if evaluation == "release_time" else "current"
+        ]["approvals"]
+
+        ok = (
+            content_ok
+            and build_ok
+            and gate["ok"]
+            and not any(
+                "product mismatch" in e for e in errors
+            )
+        )
+        return VerificationResult(ok=ok, release_id=rid,
+                                  errors=errors, checks=checks)
+
+    def _current_key_lookup(self):
+        def lookup(issuer_id: str, key_version: int):
+            try:
+                return self.keys.get_key(issuer_id, int(key_version)).to_dict()
+            except Exception:
+                return None
+
+        return lookup
+
+    @staticmethod
+    def _snapshot_key_lookup(snap: dict):
+        keys = (snap or {}).get("keys", {})
+
+        def lookup(issuer_id: str, key_version: int):
+            return keys.get(issuer_id, {}).get(str(int(key_version)))
+
+        return lookup
+
+    def _evaluate_approval_set(
+        self,
+        record: dict,
+        *,
+        now: str,
+        key_lookup,
+        crl_snapshot,
+    ) -> dict:
+        """Grade every approval and decide the quorum.
+
+        Returns a report with one verdict per approval (why it counts or
+        why it is excluded) and the per-role quorum tally. A signer can
+        fill at most one slot: additional approvals by the same issuer are
+        flagged duplicate_signer and never counted twice.
+        """
+        errors: list[str] = []
+        verdicts: list[dict] = []
+
+        # ----- policy snapshot embedded in the record -----
+        policy_snap = record.get("policy_snapshot") or {}
+        policy_body = policy_snap.get("body") or {}
+        policy_ok = self._check_embedded_policy(
+            record, policy_snap, policy_body, key_lookup, errors
+        )
+        roles = policy_body.get("roles", {})
+        assignments = policy_body.get("assignments", {})
+
+        # ----- revocation material for this evaluation -----
+        revoked: dict = {}
+        crl_version = 0
+        if crl_snapshot == "__current__":
+            crl_errors: list[str] = []
+            snap = self._load_trusted_crl(now, crl_errors)
+            errors.extend(crl_errors)
+            if snap is not None:
+                revoked = snap["body"].get("revoked", {})
+                crl_version = snap["body"]["crl_version"]
+        elif isinstance(crl_snapshot, dict):
+            body = crl_snapshot.get("body", {})
+            revoked = body.get("revoked", {})
+            crl_version = body.get("crl_version", 0)
+
+        counted_signers: set[str] = set()
+        role_counts = {role: 0 for role in roles}
+        n = self._parse_ts(now)
+
+        for entry in record.get("approvals", []):
+            appr = entry.get("approval", {})
+            issuer = appr.get("issuer_id")
+            kver = appr.get("key_version")
+            reasons: list[str] = []
+
+            # --- binding: candidate, content, policy version ---
+            if appr.get("candidate_id") != record.get("candidate_id"):
+                reasons.append("candidate_mismatch")
+            if appr.get("artifact_digest") != record.get("artifact_digest"):
+                reasons.append("artifact_digest_mismatch")
+            if appr.get("build_spec_digest") != record.get(
+                "build_spec_digest"
+            ):
+                reasons.append("build_spec_digest_mismatch")
+            if appr.get("product") != record.get("product") or appr.get(
+                "version"
+            ) != record.get("version"):
+                reasons.append("product_version_mismatch")
+            if int(appr.get("policy_version", -1)) != int(
+                record.get("policy_version", -2)
+            ):
+                reasons.append("policy_version_mismatch")
+
+            # --- role membership per the pinned policy ---
+            assigned_role = assignments.get(issuer)
+            if assigned_role is None:
+                reasons.append("issuer_not_in_policy")
+            elif assigned_role != appr.get("role"):
+                reasons.append("role_mismatch")
+
+            # --- signer key trust ---
+            key = key_lookup(issuer, kver) if issuer is not None else None
+            if key is None:
+                reasons.append("unknown_key")
+            else:
+                import base64
+
+                if not verify_signature(
+                    appr, entry.get("signature", ""),
+                    base64.b64decode(key["public_key"]),
+                ):
+                    reasons.append("bad_signature")
+                status = key.get("status")
+                if status == "active":
+                    pass
+                elif status == "rotated" and self.policy.trust_rotated:
+                    pass
+                else:
+                    reasons.append(f"key_not_active:{status}")
+                if key.get("valid_from") and self._parse_ts(
+                    key["valid_from"]
+                ) > n:
+                    reasons.append("key_not_yet_valid")
+                if key.get("valid_to") and self._parse_ts(
+                    key["valid_to"]
+                ) <= n:
+                    reasons.append("key_window_ended")
+                if key.get("scope") != appr.get("scope") or not scope_covers(
+                    key.get("scope", ""), appr.get("product", "")
+                ):
+                    reasons.append("scope_mismatch")
+                if int(kver) in revoked.get(issuer, []):
+                    reasons.append(f"key_revoked:crl_v{crl_version}")
+
+            # --- approval validity window ---
+            not_before = self._parse_ts(appr.get("not_before", ""))
+            expires = self._parse_ts(appr.get("expires_at", ""))
+            if not_before and n < not_before:
+                reasons.append("approval_not_yet_valid")
+            if expires and n >= expires:
+                reasons.append("approval_expired")
+
+            # --- one slot per signer ---
+            if issuer in counted_signers:
+                reasons.append("duplicate_signer")
+
+            counted = not reasons and policy_ok
+            if counted:
+                counted_signers.add(issuer)
+                role_counts[assigned_role] += 1
+            verdicts.append(
+                {
+                    "approval_id": entry.get("approval_id"),
+                    "issuer_id": issuer,
+                    "key_version": kver,
+                    "role": appr.get("role"),
+                    "counted": counted,
+                    "reasons": reasons or ["ok"],
+                }
+            )
+
+        quorum = {}
+        quorum_ok = policy_ok
+        for role, required in roles.items():
+            satisfied = role_counts.get(role, 0) >= int(required)
+            quorum[role] = {
+                "required": int(required),
+                "counted": role_counts.get(role, 0),
+                "satisfied": satisfied,
+            }
+            if not satisfied:
+                quorum_ok = False
+                errors.append(
+                    f"role {role}: {role_counts.get(role, 0)} of "
+                    f"{required} required approvals counted"
+                )
+        if not policy_ok:
+            errors.append("embedded policy snapshot is not trustworthy")
+
+        return {
+            "ok": quorum_ok,
+            "now": now,
+            "policy_version": record.get("policy_version"),
+            "crl_version": crl_version,
+            "approvals": verdicts,
+            "quorum": quorum,
+            "errors": errors,
+        }
+
+    def _check_embedded_policy(
+        self,
+        record: dict,
+        policy_snap: dict,
+        policy_body: dict,
+        key_lookup,
+        errors: list[str],
+    ) -> bool:
+        """The record must embed the exact policy it claims, signed by the
+        policy issuer, and its version must match the record's pin."""
+        import base64
+
+        if not policy_body:
+            errors.append("release record carries no policy snapshot")
+            return False
+        if int(policy_body.get("policy_version", -1)) != int(
+            record.get("policy_version", -2)
+        ):
+            errors.append(
+                "embedded policy version does not match record policy_version"
+            )
+            return False
+        signer = policy_body.get("issuer_id")
+        kver = policy_body.get("key_version")
+        key = key_lookup(signer, kver)
+        if key is None:
+            # Policy issuers are long-lived; fall back to the current store
+            # even when evaluating a release-time snapshot.
+            key = self._current_key_lookup()(signer, kver)
+        if key is None:
+            errors.append("policy signer key not found")
+            return False
+        if not verify_signature(
+            policy_body, policy_snap.get("signature", ""),
+            base64.b64decode(key["public_key"]),
+        ):
+            errors.append("embedded policy snapshot signature invalid")
+            return False
+        return True
 
 def export_bundle(release_record: dict, path: str) -> None:
     """Export a self-contained release attestation bundle for offline use."""

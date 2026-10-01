@@ -34,6 +34,54 @@
   任何前置步骤失败都不会向 `index.json` 写入条目，因此失败产物不可能
   被当作可信版本。
 
+## 多签发者批准（policy-based quorum）
+
+发布可由多个独立签发者共同批准，发布策略规定所需角色与数量：
+
+- **发布策略**：`policies/versions/NNNNNN.json` 为签名、不可变、带版本号
+  的策略快照，声明每个角色需要的独立批准数（`roles`）以及签发者的角色
+  分配（`assignments`）。`policies/current.json` 指向当前版本。
+- **候选（candidate）**：`begin` 为每次发布尝试生成唯一候选 ID（随机
+  nonce + 内容绑定），并钉住当时的策略版本。重试产生新候选，**不同候选
+  的批准不能混合**——即使文件内容完全相同。
+- **批准（approval）**：每个批准在签名载荷内绑定候选 ID、制品哈希、构建
+  说明哈希与策略版本，因此无法挪用到内容相同但发布条件不同的另一份记录。
+- **凑数规则**：同一签发者对同一候选只能批准一次；验证时重复的签发者
+  只计一次（多余条目标记 `duplicate_signer`），角色不符、密钥被撤销/
+  轮换、签名无效、策略版本不符的批准都会被逐条说明并不计入法定数。
+- **进入可信目录**：只有 `finalize` 时法定数满足才会原子写入索引；
+  缺少批准、构建说明被替换、部分签发失败都不会留下任何可信条目。
+
+### 双重信任评估
+
+发布记录在 `finalize` 时冻结一份 `trust_snapshot`（当时的密钥状态、
+CRL 快照、策略快照）。`verify --evaluation` 支持：
+
+- `current`（默认）：按**当前**信任库与当前 CRL 判定；
+- `release_time`：按**发布当时**冻结的信任条件判定；
+- `both`：两者同时成立才算可信。
+
+报告中 `checks.evaluations` 始终同时给出两种结论及每条批准的逐项
+判定理由，旧发布材料本身保持不变。
+
+### 多签发者命令行用法
+
+```bash
+python -m trusted_release --home store policy-set --policy-issuer sec \
+    --role build:2 --role qa:1 \
+    --assign builder-1:build --assign builder-2:build --assign qa-1:qa
+CAND=$(python -m trusted_release --home store begin \
+    --artifact app.tar.gz --build-spec BUILD.md --product app --version 1.0 \
+    | cut -d' ' -f1 | cut -d= -f2)
+python -m trusted_release --home store approve --candidate $CAND --issuer builder-1
+python -m trusted_release --home store approve --candidate $CAND --issuer builder-2
+python -m trusted_release --home store approve --candidate $CAND --issuer qa-1
+python -m trusted_release --home store finalize --candidate $CAND --bundle rel.json
+python -m trusted_release --home store verify \
+    --artifact app.tar.gz --build-spec BUILD.md --bundle rel.json \
+    --evaluation both --json
+```
+
 ## 存储布局
 
 ```
@@ -49,6 +97,15 @@ store/
   crl/
     versions/000001.json ...          # 签名、版本化的撤销快照
     current.json                      # 当前快照指针
+  policies/
+    versions/000001.json ...          # 签名、版本化的发布策略快照
+    current.json                      # 当前策略指针
+```
+
+多签发者流程还会在 `registry/candidates/` 下保存进行中的候选及其
+已收集的批准；候选未通过 `finalize` 法定数校验前不会进入索引。
+
+```
 ```
 
 ## 命令行用法

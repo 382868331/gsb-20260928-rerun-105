@@ -13,6 +13,8 @@ import sys
 
 from .attestation import RevocationList, verify_signature
 from .issuer import IssuerKeyStore
+from .pipeline import ReleasePipeline
+from .policy import PolicyStore
 from .publisher import Publisher, utc_now
 from .registry import Registry
 from .verifier import TrustPolicy, Verifier, load_bundle
@@ -26,11 +28,21 @@ def _store_paths(home: str):
     )
 
 
+def _pipeline(home: str):
+    reg = Registry(os.path.join(home, "registry"))
+    keys = IssuerKeyStore(os.path.join(home, "issuers"))
+    crl = RevocationList(os.path.join(home, "crl"))
+    policies = PolicyStore(os.path.join(home, "policies"))
+    verifier = Verifier(keys, crl)
+    return reg, keys, policies, ReleasePipeline(reg, keys, policies, verifier)
+
+
 def cmd_init(args) -> int:
     reg_dir, key_dir, crl_dir = _store_paths(args.home)
     Registry(reg_dir)
     IssuerKeyStore(key_dir)
     RevocationList(crl_dir)
+    PolicyStore(os.path.join(args.home, "policies"))
     print(f"initialized trusted release store at {args.home}")
     return 0
 
@@ -118,6 +130,97 @@ def cmd_crl_list(args) -> int:
     return 0
 
 
+def _parse_roles(items: list[str]) -> dict[str, int]:
+    roles = {}
+    for item in items:
+        role, _, count = item.partition(":")
+        roles[role] = int(count)
+    return roles
+
+
+def _parse_assignments(items: list[str]) -> dict[str, str]:
+    out = {}
+    for item in items:
+        issuer, _, role = item.partition(":")
+        out[issuer] = role
+    return out
+
+
+def cmd_policy_set(args) -> int:
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    policies = PolicyStore(os.path.join(args.home, "policies"))
+    kv = keys.latest_version(args.policy_issuer)
+    if kv is None:
+        raise SystemExit("policy issuer has no key")
+    seed = keys.load_secret(args.policy_issuer, kv)
+    snapshot = policies.issue(
+        roles=_parse_roles(args.role),
+        assignments=_parse_assignments(args.assign),
+        now=args.now or utc_now(),
+        issuer_id=args.policy_issuer,
+        key_version=kv,
+        secret_seed=seed,
+    )
+    print(f"policy v{snapshot['body']['policy_version']} issued")
+    return 0
+
+
+def cmd_policy_list(args) -> int:
+    policies = PolicyStore(os.path.join(args.home, "policies"))
+    for v in policies.list_versions():
+        snap = policies.read_version(v)
+        print(json.dumps(snap["body"], sort_keys=True))
+    return 0
+
+
+def cmd_begin(args) -> int:
+    _, _, _, pipe = _pipeline(args.home)
+    cand = pipe.begin(
+        artifact_path=args.artifact,
+        build_spec_path=args.build_spec,
+        product=args.product,
+        version=args.version,
+        now=args.now or utc_now(),
+    )
+    print(
+        f"candidate={cand['candidate_id']} "
+        f"policy_version={cand['policy_version']}"
+    )
+    return 0
+
+
+def cmd_approve(args) -> int:
+    _, _, _, pipe = _pipeline(args.home)
+    signed = pipe.approve(
+        candidate_id=args.candidate,
+        issuer_id=args.issuer,
+        now=args.now or utc_now(),
+    )
+    appr = signed["approval"]
+    print(
+        f"approved candidate={appr['candidate_id']} issuer={appr['issuer_id']} "
+        f"role={appr['role']} policy_version={appr['policy_version']}"
+    )
+    return 0
+
+
+def cmd_finalize(args) -> int:
+    _, _, _, pipe = _pipeline(args.home)
+    try:
+        record = pipe.finalize(
+            candidate_id=args.candidate, now=args.now or utc_now()
+        )
+    except RuntimeError as exc:
+        print(f"FINALIZE FAILED: {exc}", file=sys.stderr)
+        return 3
+    print(f"published release_id={record['release_id']}")
+    if args.bundle:
+        with open(args.bundle, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False, sort_keys=True)
+        print(f"offline bundle written to {args.bundle}")
+    return 0
+
+
 def cmd_verify(args) -> int:
     keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
     crl = RevocationList(os.path.join(args.home, "crl"))
@@ -141,6 +244,7 @@ def cmd_verify(args) -> int:
         build_spec_path=spec_path,
         now=args.now or utc_now(),
         expected_product=args.product,
+        evaluation=args.evaluation,
     )
     if args.json:
         print(
@@ -203,6 +307,38 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("crl-list")
     s.set_defaults(func=cmd_crl_list)
 
+    s = sub.add_parser("policy-set")
+    s.add_argument("--policy-issuer", required=True)
+    s.add_argument("--role", action="append", required=True,
+                   help="role:required_count (repeatable)")
+    s.add_argument("--assign", action="append", required=True,
+                   help="issuer_id:role (repeatable)")
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_policy_set)
+
+    s = sub.add_parser("policy-list")
+    s.set_defaults(func=cmd_policy_list)
+
+    s = sub.add_parser("begin")
+    s.add_argument("--artifact", required=True)
+    s.add_argument("--build-spec", required=True)
+    s.add_argument("--product", required=True)
+    s.add_argument("--version", required=True)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_begin)
+
+    s = sub.add_parser("approve")
+    s.add_argument("--candidate", required=True)
+    s.add_argument("--issuer", required=True)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_approve)
+
+    s = sub.add_parser("finalize")
+    s.add_argument("--candidate", required=True)
+    s.add_argument("--bundle", default="")
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_finalize)
+
     s = sub.add_parser("verify")
     s.add_argument("--artifact", required=True)
     s.add_argument("--build-spec", default="")
@@ -210,6 +346,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--bundle", default="")
     s.add_argument("--product", default=None)
     s.add_argument("--trust-rotated", action="store_true")
+    s.add_argument("--evaluation",
+                   choices=["current", "release_time", "both"],
+                   default="current")
     s.add_argument("--now", default="")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_verify)

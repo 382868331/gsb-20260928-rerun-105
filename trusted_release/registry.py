@@ -28,7 +28,8 @@ class Registry:
         self.art_dir = os.path.join(root, "artifacts")
         self.man_dir = os.path.join(root, "manifests")
         self.rel_dir = os.path.join(root, "releases")
-        for d in (self.art_dir, self.man_dir, self.rel_dir):
+        self.cand_dir = os.path.join(root, "candidates")
+        for d in (self.art_dir, self.man_dir, self.rel_dir, self.cand_dir):
             os.makedirs(d, exist_ok=True)
         self.index_path = os.path.join(root, INDEX_FILE)
         if not os.path.exists(self.index_path):
@@ -49,13 +50,8 @@ class Registry:
     def _atomic_json(self, path: str, obj: dict) -> None:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    canonical_json(obj).decode("utf-8"),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            json.dump(obj, f, indent=2, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
         os.replace(tmp, path)
 
     # ---------- artifact storage ----------
@@ -133,6 +129,28 @@ class Registry:
         return manifest
 
     # ---------- release index ----------
+    # ---------- release candidates (multi-signer pipeline) ----------
+    def _candidate_path(self, candidate_id: str) -> str:
+        return os.path.join(self.cand_dir, candidate_id + ".json")
+
+    def write_candidate(self, candidate: dict) -> None:
+        """Persist a candidate and its collected approvals (atomic)."""
+        self._atomic_json(self._candidate_path(candidate["candidate_id"]),
+                          candidate)
+
+    def read_candidate(self, candidate_id: str) -> dict:
+        with open(self._candidate_path(candidate_id), "r",
+                  encoding="utf-8") as f:
+            return json.load(f)
+
+    def has_candidate(self, candidate_id: str) -> bool:
+        return os.path.exists(self._candidate_path(candidate_id))
+
+    def list_candidate_ids(self) -> list[str]:
+        return sorted(
+            f[:-5] for f in os.listdir(self.cand_dir) if f.endswith(".json")
+        )
+
     def index_release(self, record: dict) -> None:
         """Append a fully signed release to the trusted catalog.
 
@@ -151,19 +169,34 @@ class Registry:
         rel_path = os.path.join(self.rel_dir, record["release_id"] + ".json")
         if not os.path.exists(rel_path):
             self._atomic_json(rel_path, record)
-        idx["releases"].append(
-            {
-                "release_id": record["release_id"],
-                "product": record["product"],
-                "version": record["version"],
-                "artifact_digest": record["artifact_digest"],
-                "build_spec_digest": record["build_spec_digest"],
-                "issuer_id": record["issuer_id"],
-                "key_version": record["key_version"],
-                "issued_at": record["issued_at"],
-                "expires_at": record["expires_at"],
-            }
-        )
+        if record.get("type") == "trusted-release/release/v2":
+            idx["releases"].append(
+                {
+                    "release_id": record["release_id"],
+                    "type": record["type"],
+                    "product": record["product"],
+                    "version": record["version"],
+                    "artifact_digest": record["artifact_digest"],
+                    "build_spec_digest": record["build_spec_digest"],
+                    "policy_version": record["policy_version"],
+                    "approval_count": len(record.get("approvals", [])),
+                    "issued_at": record["issued_at"],
+                }
+            )
+        else:
+            idx["releases"].append(
+                {
+                    "release_id": record["release_id"],
+                    "product": record["product"],
+                    "version": record["version"],
+                    "artifact_digest": record["artifact_digest"],
+                    "build_spec_digest": record["build_spec_digest"],
+                    "issuer_id": record["issuer_id"],
+                    "key_version": record["key_version"],
+                    "issued_at": record["issued_at"],
+                    "expires_at": record["expires_at"],
+                }
+            )
         self._write_index(idx)
 
     def read_release(self, release_id: str) -> dict:
