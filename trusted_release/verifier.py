@@ -20,8 +20,9 @@ import json
 from dataclasses import dataclass, field
 
 from .attestation import verify_signature
-from .encoding import file_digest
+from .encoding import canonical_hash, canonical_json, file_digest
 from .issuer import IssuerKeyStore
+from .policy import ReleasePolicy
 
 
 @dataclass
@@ -73,12 +74,19 @@ class Verifier:
         build_spec_path: str | None = None,
         now: str,
         expected_product: str | None = None,
+        as_of: str = "current",
     ) -> VerificationResult:
         errors: list[str] = []
         checks: dict = {}
         att = release_record.get("attestation", {})
         signature = release_record.get("signature", "")
         rid = att.get("release_id", release_record.get("release_id", "?"))
+        if release_record.get("type") == "trusted-release/release/v2":
+            return self._verify_policy_release(
+                release_record, artifact_path=artifact_path,
+                build_spec_path=build_spec_path, now=now,
+                expected_product=expected_product, as_of=as_of,
+            )
 
         # ---------- 1. content binding ----------
         actual_artifact_digest = file_digest(artifact_path)
@@ -191,7 +199,7 @@ class Verifier:
             # ---------- current revocation material ----------
             # The CRL is itself signed; an unsigned/tampered/expired-authority
             # CRL must not be trusted (fail closed).
-            snapshot = self._load_trusted_crl(now, errors)
+            snapshot = self._load_trusted_crl(now, errors, as_of=as_of)
             revoked = {}
             crl_version = 0
             if snapshot is not None:
@@ -237,12 +245,36 @@ class Verifier:
         return VerificationResult(ok=ok, release_id=rid,
                                   errors=errors, checks=checks)
 
-    def _load_trusted_crl(self, now: str, errors: list[str]):
+    def _load_trusted_crl(self, now: str, errors: list[str], as_of: str = "current"):
         if self.crl is None:
             return None
-        snapshot = self.crl.read_current()
+        snapshot = self._read_crl_snapshot(now, as_of, None)
         if snapshot is None:
             return None
+        return self._validate_crl_snapshot(snapshot, now, errors, as_of)
+
+    def _read_crl_snapshot(self, now: str, as_of: str, record: dict | None):
+        if as_of == "release" and record is not None and record.get("crl_version_at_release"):
+            return self.crl.read_version(int(record["crl_version_at_release"]))
+        if as_of == "release" and record is not None:
+            target = self._parse_ts(record.get("released_at", now))
+            chosen = None
+            for version in self.crl.list_versions():
+                snap = self.crl.read_version(version)
+                if self._parse_ts(snap["body"].get("issued_at", "")) <= target:
+                    chosen = snap
+            return chosen
+        if as_of not in ("current", "release"):
+            target = self._parse_ts(as_of)
+            chosen = None
+            for version in self.crl.list_versions():
+                snap = self.crl.read_version(version)
+                if self._parse_ts(snap["body"].get("issued_at", "")) <= target:
+                    chosen = snap
+            return chosen
+        return self.crl.read_current()
+
+    def _validate_crl_snapshot(self, snapshot, now: str, errors: list[str], as_of: str):
         body = snapshot["body"]
         crl_issuer = body.get("issuer_id")
         crl_kv = body.get("key_version")
@@ -258,12 +290,10 @@ class Verifier:
             base64.b64decode(crl_key.public_key),
         )
         ptr = self.crl.current_version_number()
-        if not sig_ok or ptr != body.get("crl_version"):
+        if not sig_ok or (as_of == "current" and ptr != body.get("crl_version")):
             errors.append("current revocation list failed signature/version check")
             return None
-        if crl_key.status not in ("active",) and not (
-            crl_key.status == "rotated" and self.policy.trust_rotated
-        ):
+        if not self._key_status_ok(crl_key, now, as_of):
             errors.append(
                 f"CRL signing key not currently trusted (status={crl_key.status})"
             )
@@ -274,6 +304,142 @@ class Verifier:
             errors.append("CRL signing key applicability window ended")
             return None
         return snapshot
+
+    def _key_status_ok(self, key, now: str, as_of: str) -> bool:
+        changed_at = self._parse_ts(key.status_changed_at) if key.status_changed_at else ""
+        if changed_at and changed_at > self._parse_ts(now):
+            return True
+        if key.status == "active":
+            return True
+        if key.status == "rotated":
+            return self.policy.trust_rotated
+        return False
+
+    def _crl_for(self, record: dict, now: str, as_of: str, errors: list[str]):
+        snapshot = self._read_crl_snapshot(now, as_of, record)
+        if snapshot is None:
+            if self.crl is not None and self.crl.list_versions():
+                errors.append("no revocation snapshot available for requested evaluation time")
+            return {}, 0
+        valid = self._validate_crl_snapshot(snapshot, now, errors, as_of)
+        if valid is None:
+            return {}, 0
+        return valid["body"].get("revoked", {}), valid["body"]["crl_version"]
+
+    def _verify_policy_release(self, record: dict, *, artifact_path: str,
+                               build_spec_path: str | None, now: str,
+                               expected_product: str | None,
+                               as_of: str) -> VerificationResult:
+        errors: list[str] = []
+        checks: dict = {}
+        rid = record.get("release_id", "?")
+        candidate = record.get("candidate", {})
+        try:
+            policy = ReleasePolicy.from_dict(record.get("policy", candidate.get("policy", {})))
+        except Exception as exc:
+            return VerificationResult(False, rid, [f"invalid release policy: {exc}"], {})
+        policy_data = policy.to_dict()
+        if candidate.get("policy") != policy_data or record.get("policy") != policy_data:
+            errors.append("policy mismatch: release and candidate policies differ")
+        if record.get("policy_digest") != policy.digest or candidate.get("policy_digest") != policy.digest:
+            errors.append("policy digest mismatch")
+        expected_candidate_digest = canonical_hash({
+            "artifact_digest": candidate.get("artifact_digest"),
+            "build_spec_digest": candidate.get("build_spec_digest"),
+            "policy": policy_data,
+            "product": candidate.get("product"),
+            "version": candidate.get("version"),
+            "nonce": candidate.get("nonce"),
+        })
+        if candidate.get("candidate_digest") != expected_candidate_digest:
+            errors.append("candidate digest mismatch")
+        actual_artifact = file_digest(artifact_path)
+        content_ok = actual_artifact == record.get("artifact_digest") == candidate.get("artifact_digest")
+        checks["artifact_digest"] = {"expected": record.get("artifact_digest"), "actual": actual_artifact, "ok": content_ok}
+        if not content_ok:
+            errors.append("artifact content mismatch: presented file does not match signed digest")
+        build_ok = True
+        if build_spec_path is not None:
+            actual_spec = file_digest(build_spec_path)
+            build_ok = actual_spec == record.get("build_spec_digest") == candidate.get("build_spec_digest")
+            checks["build_spec_digest"] = {"expected": record.get("build_spec_digest"), "actual": actual_spec, "ok": build_ok}
+            if not build_ok:
+                errors.append("build spec mismatch: presented build spec does not match signed digest")
+        if expected_product is not None and record.get("product") != expected_product:
+            errors.append(f"product mismatch: expected {expected_product}, attested {record.get('product')}")
+        effective_now = record.get("released_at", now) if as_of == "release" else now
+        revoked, crl_version = self._crl_for(record, effective_now, as_of, errors)
+        approval_checks = []
+        counted = {role: set() for role in policy.requirements}
+        seen_issuers: set[str] = set()
+        import base64
+        for envelope in sorted(record.get("approvals", []), key=lambda x: x.get("approval_id", "")):
+            approval = envelope.get("approval", {})
+            issuer_id = approval.get("issuer_id")
+            key_version = approval.get("key_version")
+            check = {"approval_id": envelope.get("approval_id", ""), "issuer": issuer_id,
+                     "key_version": key_version, "role": approval.get("role"),
+                     "ok": False, "counted": False, "reasons": []}
+            key = None
+            try:
+                key = self.keys.get_key(issuer_id, int(key_version))
+            except Exception as exc:
+                check["reasons"].append(f"key not found: {exc}")
+            if key is not None:
+                sig_ok = verify_signature(approval, envelope.get("signature", ""), base64.b64decode(key.public_key))
+                check["signature_ok"] = sig_ok
+                if not sig_ok:
+                    check["reasons"].append("signature verification failed")
+                if not self._key_status_ok(key, effective_now, as_of):
+                    check["reasons"].append(f"not currently trusted (status={key.status})")
+                n = self._parse_ts(effective_now)
+                if key.valid_from and self._parse_ts(key.valid_from) > n:
+                    check["reasons"].append("key not yet valid")
+                if key.valid_to and self._parse_ts(key.valid_to) <= n:
+                    check["reasons"].append("key applicability window has ended")
+                if approval.get("not_before") and n < self._parse_ts(approval["not_before"]):
+                    check["reasons"].append("approval not yet valid")
+                if approval.get("expires_at") and n >= self._parse_ts(approval["expires_at"]):
+                    check["reasons"].append("approval expired")
+                if int(key_version) in revoked.get(issuer_id, []):
+                    check["reasons"].append(f"revoked by CRL v{crl_version}")
+                if key.scope != approval.get("scope") or not scope_covers(key.scope, record.get("product", "")):
+                    check["reasons"].append("scope mismatch")
+                if key.role != approval.get("role"):
+                    check["reasons"].append("role mismatch")
+            bindings = {
+                "candidate_id": candidate.get("candidate_id"),
+                "candidate_digest": candidate.get("candidate_digest"),
+                "release_id": record.get("release_id"),
+                "product": record.get("product"),
+                "version": record.get("version"),
+                "artifact_digest": record.get("artifact_digest"),
+                "build_spec_digest": record.get("build_spec_digest"),
+                "policy_id": policy.policy_id,
+                "policy_version": policy.policy_version,
+                "policy_digest": policy.digest,
+            }
+            for field_name, expected in bindings.items():
+                if approval.get(field_name) != expected:
+                    check["reasons"].append(f"approval binding mismatch: {field_name}")
+            if issuer_id in seen_issuers:
+                check["reasons"].append("duplicate issuer cannot be counted twice")
+            valid_role = approval.get("role") in policy.requirements
+            if not valid_role:
+                check["reasons"].append("role not required by policy")
+            check["ok"] = not check["reasons"]
+            if check["ok"] and issuer_id not in seen_issuers:
+                counted[approval["role"]].add(issuer_id)
+                check["counted"] = True
+            seen_issuers.add(issuer_id)
+            approval_checks.append(check)
+        counts = {role: len(issuers) for role, issuers in counted.items()}
+        checks.update({"approvals": approval_checks, "approval_counts": counts,
+                       "policy_requirements": policy.requirements, "crl_version": crl_version})
+        for role, required in policy.requirements.items():
+            if counts.get(role, 0) < required:
+                errors.append(f"insufficient valid distinct issuers for role {role}: have {counts.get(role, 0)}, need {required}")
+        return VerificationResult(not errors, rid, errors, checks)
 
 
 def export_bundle(release_record: dict, path: str) -> None:

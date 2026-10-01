@@ -3,6 +3,7 @@
 from .attestation import RevocationList, build_attestation, sign_attestation
 from .issuer import IssuerKeyStore
 from .publisher import Publisher, utc_now
+from .policy import ReleasePolicy
 from .registry import Registry
 from .verifier import TrustPolicy, Verifier
 
@@ -12,6 +13,7 @@ __all__ = [
     "sign_attestation",
     "IssuerKeyStore",
     "Publisher",
+    "ReleasePolicy",
     "Registry",
     "TrustPolicy",
     "Verifier",

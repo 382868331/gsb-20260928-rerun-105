@@ -10,6 +10,7 @@ from . import ed25519
 from .encoding import canonical_hash, canonical_json
 
 ATTESTATION_TYPE = "trusted-release/attestation/v1"
+APPROVAL_TYPE = "trusted-release/approval/v1"
 
 
 def build_attestation(
@@ -56,6 +57,39 @@ def sign_attestation(attestation: dict, secret_seed: bytes) -> dict:
     }
     record["attestation_id"] = canonical_hash(record["attestation"])
     return record
+
+
+def build_approval(
+    *,
+    candidate: dict,
+    issuer_id: str,
+    key_version: int,
+    role: str,
+    scope: str,
+    issued_at: str,
+    expires_at: str,
+    not_before: str,
+) -> dict:
+    return {
+        "type": APPROVAL_TYPE,
+        "candidate_id": candidate["candidate_id"],
+        "candidate_digest": candidate["candidate_digest"],
+        "release_id": candidate["release_id"],
+        "product": candidate["product"],
+        "version": candidate["version"],
+        "artifact_digest": candidate["artifact_digest"],
+        "build_spec_digest": candidate["build_spec_digest"],
+        "policy_id": candidate["policy"]["policy_id"],
+        "policy_version": candidate["policy"]["policy_version"],
+        "policy_digest": candidate["policy_digest"],
+        "issuer_id": issuer_id,
+        "key_version": key_version,
+        "role": role,
+        "scope": scope,
+        "issued_at": issued_at,
+        "not_before": not_before,
+        "expires_at": expires_at,
+    }
 
 
 def verify_signature(attestation: dict, signature_b64: str, public_key: bytes) -> bool:

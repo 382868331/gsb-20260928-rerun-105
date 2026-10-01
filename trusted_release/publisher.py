@@ -1,20 +1,14 @@
-"""High-level publish orchestration.
-
-Order of operations guarantees that a failed/interrupted publish never
-leaves anything that could be treated as a trusted release in the index:
-
-1. artifact + build spec are registered (content-addressed);
-2. the attestation is built and signed; only then
-3. is the release appended to the index (last, atomic step).
-"""
+"""High-level publish orchestration."""
 
 from __future__ import annotations
 
 import datetime
+import os
 
-from .attestation import build_attestation, sign_attestation
+from .attestation import build_approval, build_attestation, sign_attestation
 from .encoding import canonical_hash
 from .issuer import IssuerKeyStore
+from .policy import CANDIDATE_TYPE, ReleasePolicy
 from .registry import Registry
 
 
@@ -26,9 +20,10 @@ def utc_now(offset_days: int = 0) -> str:
 
 
 class Publisher:
-    def __init__(self, registry: Registry, keystore: IssuerKeyStore):
+    def __init__(self, registry: Registry, keystore: IssuerKeyStore, crl=None):
         self.registry = registry
         self.keystore = keystore
+        self.crl = crl
 
     def publish(
         self,
@@ -42,7 +37,6 @@ class Publisher:
         validity_days: int = 365,
         metadata: dict | None = None,
     ) -> dict:
-        # 1. register + bind (fails on unreadable/tampered input)
         manifest = self.registry.register_artifact(
             source_path=artifact_path,
             product=product,
@@ -52,15 +46,12 @@ class Publisher:
             metadata=metadata,
         )
 
-        # 2. sign with the issuer's CURRENT key
         kv = self.keystore.latest_version(issuer_id)
         if kv is None:
             raise LookupError(f"issuer {issuer_id} has no keys")
         key = self.keystore.get_key(issuer_id, kv)
         if key.status != "active":
-            raise RuntimeError(
-                f"current key v{kv} of {issuer_id} is not active"
-            )
+            raise RuntimeError(f"current key v{kv} of {issuer_id} is not active")
         seed = self.keystore.load_secret(issuer_id, kv)
 
         expires = self._shift(now, validity_days)
@@ -97,10 +88,130 @@ class Publisher:
             "attestation_id": signed["attestation_id"],
         }
         record["record_id"] = canonical_hash(
-            {k: record[k] for k in record if k not in ("record_id",)}
+            {k: record[k] for k in record if k != "record_id"}
         )
+        self.registry.index_release(record)
+        return record
 
-        # 3. index LAST (atomic) - nothing trusted exists before this point
+    def create_candidate(
+        self,
+        *,
+        artifact_path: str,
+        build_spec_path: str,
+        product: str,
+        version: str,
+        policy: dict | ReleasePolicy,
+        now: str,
+        metadata: dict | None = None,
+    ) -> dict:
+        policy_obj = policy if isinstance(policy, ReleasePolicy) else ReleasePolicy.from_dict(policy)
+        policy_data = policy_obj.to_dict()
+        manifest = self.registry.register_artifact(
+            source_path=artifact_path,
+            product=product,
+            version=version,
+            build_spec_path=build_spec_path,
+            now=now,
+            metadata=metadata,
+        )
+        nonce = os.urandom(16).hex()
+        candidate_digest = canonical_hash(
+            {
+                "artifact_digest": manifest["artifact_digest"],
+                "build_spec_digest": manifest["build_spec_digest"],
+                "policy": policy_data,
+                "product": product,
+                "version": version,
+                "nonce": nonce,
+            }
+        )
+        return {
+            "type": CANDIDATE_TYPE,
+            "candidate_id": candidate_digest.split(":", 1)[1][:24],
+            "candidate_digest": candidate_digest,
+            "nonce": nonce,
+            "release_id": f"{product}-{version}-{candidate_digest.split(':',1)[1][:12]}",
+            "product": product,
+            "version": version,
+            "artifact_digest": manifest["artifact_digest"],
+            "build_spec_digest": manifest["build_spec_digest"],
+            "policy": policy_data,
+            "policy_digest": canonical_hash(policy_data),
+            "created_at": now,
+        }
+
+    def approve_candidate(
+        self,
+        candidate: dict,
+        *,
+        issuer_id: str,
+        now: str,
+        validity_days: int = 365,
+    ) -> dict:
+        kv = self.keystore.latest_version(issuer_id)
+        if kv is None:
+            raise LookupError(f"issuer {issuer_id} has no keys")
+        key = self.keystore.get_key(issuer_id, kv)
+        if key.status != "active":
+            raise RuntimeError(f"current key v{kv} of {issuer_id} is not active")
+        approval = build_approval(
+            candidate=candidate,
+            issuer_id=issuer_id,
+            key_version=kv,
+            role=key.role,
+            scope=key.scope,
+            issued_at=now,
+            not_before=now,
+            expires_at=self._shift(now, validity_days),
+        )
+        signed = sign_attestation(approval, self.keystore.load_secret(issuer_id, kv))
+        return {
+            "approval": signed["attestation"],
+            "signature": signed["signature"],
+            "approval_id": signed["attestation_id"],
+        }
+
+    def publish_candidate(self, candidate: dict, approvals: list[dict], *, now: str) -> dict:
+        from .verifier import Verifier
+
+        if self.crl is None:
+            raise ValueError("a revocation list is required for policy-gated publishing")
+        policy = ReleasePolicy.from_dict(candidate["policy"])
+        if candidate.get("policy_digest") != policy.digest:
+            raise ValueError("candidate policy digest mismatch")
+        record = {
+            "release_id": candidate["release_id"],
+            "type": "trusted-release/release/v2",
+            "candidate": candidate,
+            "candidate_id": candidate["candidate_id"],
+            "candidate_digest": candidate["candidate_digest"],
+            "product": candidate["product"],
+            "version": candidate["version"],
+            "artifact_digest": candidate["artifact_digest"],
+            "build_spec_digest": candidate["build_spec_digest"],
+            "policy": policy.to_dict(),
+            "policy_digest": policy.digest,
+            "approvals": list(approvals),
+            "released_at": now,
+        }
+        current = self.crl.read_current()
+        if current is not None:
+            record["crl_version_at_release"] = current["body"]["crl_version"]
+        result = Verifier(self.keystore, self.crl).verify_release(
+            record,
+            artifact_path=self.registry.artifact_path(candidate["artifact_digest"]),
+            build_spec_path=self.registry.artifact_path(candidate["build_spec_digest"]),
+            now=now,
+            as_of="release",
+            expected_product=candidate["product"],
+        )
+        if not result.ok:
+            raise ValueError(
+                "candidate does not satisfy release policy: " + "; ".join(result.errors)
+            )
+        record["record_id"] = canonical_hash(
+            {k: record[k] for k in record if k != "record_id"}
+        )
         self.registry.index_release(record)
         return record
 
@@ -109,6 +220,4 @@ class Publisher:
         dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=datetime.timezone.utc
         )
-        return (dt + datetime.timedelta(days=days)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        return (dt + datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")

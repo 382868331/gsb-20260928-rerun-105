@@ -49,13 +49,7 @@ class Registry:
     def _atomic_json(self, path: str, obj: dict) -> None:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    canonical_json(obj).decode("utf-8"),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            f.write(canonical_json(obj).decode("utf-8"))
         os.replace(tmp, path)
 
     # ---------- artifact storage ----------
@@ -158,10 +152,13 @@ class Registry:
                 "version": record["version"],
                 "artifact_digest": record["artifact_digest"],
                 "build_spec_digest": record["build_spec_digest"],
-                "issuer_id": record["issuer_id"],
-                "key_version": record["key_version"],
-                "issued_at": record["issued_at"],
-                "expires_at": record["expires_at"],
+                "issuer_id": record.get("issuer_id", ""),
+                "key_version": record.get("key_version", 0),
+                "issued_at": record.get("issued_at", record.get("released_at", "")),
+                "expires_at": record.get("expires_at", ""),
+                "policy_id": record.get("policy", {}).get("policy_id", ""),
+                "policy_version": record.get("policy", {}).get("policy_version", 0),
+                "approval_count": len(record.get("approvals", [])),
             }
         )
         self._write_index(idx)

@@ -13,6 +13,7 @@ from trusted_release import (
     TrustPolicy,
     Verifier,
 )
+from trusted_release.policy import ReleasePolicy
 
 NOW = "2026-01-01T00:00:00Z"
 LATER = "2026-06-01T00:00:00Z"
@@ -268,3 +269,84 @@ def test_tampered_crl_is_rejected_fail_closed(store):
         record, artifact_path=str(art), build_spec_path=str(spec), now=NOW)
     assert not result.ok
     assert any("revocation list failed" in e for e in result.errors)
+
+
+def test_multi_issuer_policy_release_and_current_vs_release_verification(store):
+    _, reg, keys, crl, art, spec = store
+    keys.create_key("build-a", scope="product:widget", role="build", now=NOW)
+    keys.create_key("build-b", scope="product:widget", role="build", now=NOW)
+    keys.create_key("security", scope="product:widget", role="security", now=NOW)
+    seed = keys.load_secret("security", 1)
+    crl.issue(revoked={}, reason="baseline", now=NOW, issuer_id="security",
+              key_version=1, secret_seed=seed)
+    policy = ReleasePolicy("widget-release", 1, {"build": 2, "security": 1})
+    pub = Publisher(reg, keys, crl)
+    candidate = pub.create_candidate(
+        artifact_path=str(art), build_spec_path=str(spec),
+        product="widget", version="2.0", policy=policy, now=NOW)
+    approvals = [
+        pub.approve_candidate(candidate, issuer_id=issuer, now=NOW)
+        for issuer in ("build-a", "build-b", "security")
+    ]
+    record = pub.publish_candidate(candidate, approvals, now=NOW)
+    v = Verifier(keys, crl)
+    current_now = v.verify_release(
+        record, artifact_path=str(art), build_spec_path=str(spec), now=NOW)
+    assert current_now.ok, current_now.errors
+
+    crl.issue(revoked={"build-a": [1]}, reason="compromise", now=LATER,
+              issuer_id="security", key_version=1, secret_seed=seed)
+    keys.set_status("build-a", 1, "revoked", status_changed_at=LATER)
+    keys.create_key("security", scope="product:widget", role="security", now=FUTURE)
+    current_later = v.verify_release(
+        record, artifact_path=str(art), build_spec_path=str(spec), now=LATER)
+    assert not current_later.ok
+    invalid = next(c for c in current_later.checks["approvals"] if c["issuer"] == "build-a")
+    assert any("revoked" in reason for reason in invalid["reasons"])
+    release_view = v.verify_release(
+        record, artifact_path=str(art), build_spec_path=str(spec),
+        now=LATER, as_of="release")
+    assert release_view.ok, release_view.errors
+    assert reg.read_release(record["release_id"]) == record
+
+
+def test_duplicate_issuer_and_wrong_role_do_not_satisfy_quorum(store):
+    _, reg, keys, crl, art, spec = store
+    keys.create_key("build-a", scope="product:widget", role="build", now=NOW)
+    keys.create_key("other", scope="product:widget", role="other", now=NOW)
+    policy = ReleasePolicy("widget-release", 1, {"build": 2})
+    pub = Publisher(reg, keys, crl)
+    candidate = pub.create_candidate(
+        artifact_path=str(art), build_spec_path=str(spec),
+        product="widget", version="2.0", policy=policy, now=NOW)
+    approvals = [
+        pub.approve_candidate(candidate, issuer_id="build-a", now=NOW),
+        pub.approve_candidate(candidate, issuer_id="build-a", now=NOW),
+        pub.approve_candidate(candidate, issuer_id="other", now=NOW),
+    ]
+    with pytest.raises(ValueError):
+        pub.publish_candidate(candidate, approvals, now=NOW)
+    assert reg.read_index()["releases"] == []
+    assert reg.list_release_ids() == []
+
+
+def test_approvals_cannot_be_mixed_between_distinct_candidates(store):
+    _, reg, keys, crl, art, spec = store
+    for issuer in ("build-a", "build-b"):
+        keys.create_key(issuer, scope="product:widget", role="build", now=NOW)
+    policy1 = ReleasePolicy("widget-release", 1, {"build": 2})
+    policy2 = ReleasePolicy("widget-release", 2, {"build": 2})
+    pub = Publisher(reg, keys, crl)
+    c1 = pub.create_candidate(
+        artifact_path=str(art), build_spec_path=str(spec),
+        product="widget", version="2.0", policy=policy1, now=NOW)
+    c2 = pub.create_candidate(
+        artifact_path=str(art), build_spec_path=str(spec),
+        product="widget", version="2.0", policy=policy2, now=NOW)
+    mixed = [
+        pub.approve_candidate(c1, issuer_id="build-a", now=NOW),
+        pub.approve_candidate(c2, issuer_id="build-b", now=NOW),
+    ]
+    with pytest.raises(ValueError):
+        pub.publish_candidate(c1, mixed, now=NOW)
+    assert reg.read_index()["releases"] == []

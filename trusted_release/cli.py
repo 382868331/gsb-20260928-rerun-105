@@ -16,6 +16,7 @@ from .issuer import IssuerKeyStore
 from .publisher import Publisher, utc_now
 from .registry import Registry
 from .verifier import TrustPolicy, Verifier, load_bundle
+from .policy import ReleasePolicy
 
 
 def _store_paths(home: str):
@@ -42,6 +43,7 @@ def cmd_key_create(args) -> int:
         scope=args.scope,
         now=args.now or utc_now(),
         valid_to=args.valid_to or "",
+        role=args.role,
     )
     print(
         f"issuer={rec.issuer_id} key_version={rec.key_version} "
@@ -78,6 +80,56 @@ def cmd_publish(args) -> int:
     return 0
 
 
+def cmd_candidate(args) -> int:
+    reg = Registry(os.path.join(args.home, "registry"))
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    requirements = {}
+    for item in args.require:
+        role, count = item.split("=", 1)
+        requirements[role] = int(count)
+    candidate = Publisher(reg, keys).create_candidate(
+        artifact_path=args.artifact,
+        build_spec_path=args.build_spec,
+        product=args.product,
+        version=args.version,
+        policy=ReleasePolicy(args.policy_id, args.policy_version, requirements),
+        now=args.now or utc_now(),
+    )
+    with open(args.bundle, "w", encoding="utf-8") as f:
+        json.dump(candidate, f, indent=2, ensure_ascii=False, sort_keys=True)
+    print(f"candidate_id={candidate['candidate_id']} bundle={args.bundle}")
+    return 0
+
+
+def cmd_approve(args) -> int:
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    with open(args.candidate, "r", encoding="utf-8") as f:
+        candidate = json.load(f)
+    approval = Publisher(Registry(os.path.join(args.home, "registry")), keys).approve_candidate(
+        candidate, issuer_id=args.issuer, now=args.now or utc_now(),
+        validity_days=args.validity_days,
+    )
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(approval, f, indent=2, ensure_ascii=False, sort_keys=True)
+    print(f"approval_id={approval['approval_id']} output={args.output}")
+    return 0
+
+
+def cmd_finalize(args) -> int:
+    reg = Registry(os.path.join(args.home, "registry"))
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    crl = RevocationList(os.path.join(args.home, "crl"))
+    with open(args.candidate, "r", encoding="utf-8") as f:
+        candidate = json.load(f)
+    approvals = [load_bundle(path) for path in args.approvals]
+    record = Publisher(reg, keys, crl).publish_candidate(
+        candidate, approvals, now=args.now or utc_now())
+    with open(args.bundle, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False, sort_keys=True)
+    print(f"published release_id={record['release_id']} bundle={args.bundle}")
+    return 0
+
+
 def cmd_list(args) -> int:
     reg = Registry(os.path.join(args.home, "registry"))
     idx = reg.read_index()
@@ -105,7 +157,7 @@ def cmd_revoke(args) -> int:
     )
     # Also mark revoked key status in the keystore history.
     for ver in args.key_versions:
-        keys.set_status(args.issuer, ver, "revoked")
+        keys.set_status(args.issuer, ver, "revoked", args.now or utc_now())
     print(f"CRL v{snapshot['body']['crl_version']} issued")
     return 0
 
@@ -129,7 +181,7 @@ def cmd_verify(args) -> int:
     else:
         record = reg.read_release(args.release_id)
 
-    spec_path = args.build_spec
+    spec_path = args.build_spec or None
     if spec_path is None:
         digest = record["build_spec_digest"]
         stored = reg.artifact_path(digest)
@@ -141,6 +193,7 @@ def cmd_verify(args) -> int:
         build_spec_path=spec_path,
         now=args.now or utc_now(),
         expected_product=args.product,
+        as_of="release" if args.as_of_release else "current",
     )
     if args.json:
         print(
@@ -171,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--issuer", required=True)
     s.add_argument("--scope", required=True)
     s.add_argument("--valid-to", default="")
+    s.add_argument("--role", default="")
     s.add_argument("--now", default="")
     s.set_defaults(func=cmd_key_create)
 
@@ -188,6 +242,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--bundle", default="")
     s.add_argument("--now", default="")
     s.set_defaults(func=cmd_publish)
+
+    s = sub.add_parser("candidate")
+    s.add_argument("--artifact", required=True)
+    s.add_argument("--build-spec", required=True)
+    s.add_argument("--product", required=True)
+    s.add_argument("--version", required=True)
+    s.add_argument("--policy-id", required=True)
+    s.add_argument("--policy-version", type=int, required=True)
+    s.add_argument("--require", action="append", required=True)
+    s.add_argument("--bundle", required=True)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_candidate)
+
+    s = sub.add_parser("approve")
+    s.add_argument("--candidate", required=True)
+    s.add_argument("--issuer", required=True)
+    s.add_argument("--output", required=True)
+    s.add_argument("--validity-days", type=int, default=365)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_approve)
+
+    s = sub.add_parser("finalize")
+    s.add_argument("--candidate", required=True)
+    s.add_argument("--approvals", nargs="+", required=True)
+    s.add_argument("--bundle", required=True)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_finalize)
 
     s = sub.add_parser("list")
     s.set_defaults(func=cmd_list)
@@ -210,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--bundle", default="")
     s.add_argument("--product", default=None)
     s.add_argument("--trust-rotated", action="store_true")
+    s.add_argument("--as-of-release", action="store_true")
     s.add_argument("--now", default="")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_verify)

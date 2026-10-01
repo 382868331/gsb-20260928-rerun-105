@@ -22,6 +22,17 @@
 
 ## 关键机制
 
+- **多签发者策略门控**：策略以完整不可变版本（`policy_id`、`policy_version`
+  和各角色所需独立签发者数量）绑定到候选与每份批准。验证只统计签名有效、
+  当前或指定时点可信、角色和范围匹配的批准；同一签发者的多份批准不能重复
+  凑数，即使声明成不同角色也只计一次。
+- **候选隔离**：每次重试都生成带随机 nonce 的新候选，批准签名绑定候选
+  digest、具体制品哈希、构建说明哈希以及完整策略版本。内容相同但策略版本
+  或发布条件不同的记录不能互换批准；不同候选的批准也不能在 finalize 时混合。
+- **发布当时/当前双结论**：旧发布材料不可变。默认按当前公钥状态与当前 CRL
+  验证；`--as-of-release` 使用记录中的发布时间与发布时 CRL 版本复盘当时结论。
+  后续撤销或轮换可使当前结论失败，但不会改写发布当时结论。
+
 - **签发者轮换**：`issuers/keys.json` 中密钥带版本号。新建密钥时旧密钥
   自动置为 `rotated`，仅最新版本可签发；历史记录保留旧版本。
 - **证明过期**：`not_before` / `expires_at` 在签名载荷内，验证时按
@@ -60,8 +71,21 @@ python -m trusted_release --home store key-create --issuer build --scope 'produc
 python -m trusted_release --home store publish \
     --artifact app.tar.gz --build-spec BUILD.md \
     --product app --version 1.0 --issuer build --bundle rel.json
+python -m trusted_release --home store key-create --issuer qa --scope 'product:app' --role qa
+python -m trusted_release --home store candidate \
+    --artifact app.tar.gz --build-spec BUILD.md \
+    --product app --version 2.0 --policy-id standard --policy-version 3 \
+    --require build=1 --require qa=1 --bundle candidate.json
+python -m trusted_release --home store approve --candidate candidate.json --issuer build --output build.json
+python -m trusted_release --home store approve --candidate candidate.json --issuer qa --output qa.json
+python -m trusted_release --home store finalize \
+    --candidate candidate.json --approvals build.json qa.json --bundle rel-v2.json
 python -m trusted_release --home store verify \
     --artifact app.tar.gz --build-spec BUILD.md --bundle rel.json
+python -m trusted_release --home store verify \
+    --artifact app.tar.gz --build-spec BUILD.md --bundle rel-v2.json --json
+python -m trusted_release --home store verify \
+    --artifact app.tar.gz --build-spec BUILD.md --bundle rel-v2.json --as-of-release
 python -m trusted_release --home store key-create --issuer build --scope 'product:app'  # 轮换
 python -m trusted_release --home store revoke --crl-issuer sec --issuer build --key-versions 1
 python -m trusted_release --home store list      # 历史发布

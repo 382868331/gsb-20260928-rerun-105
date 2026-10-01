@@ -27,8 +27,10 @@ class KeyRecord:
     created_at: str
     status: str              # "active" | "rotated" | "revoked"
     scope: str               # applicable product/component scope
+    role: str                # release approval role
     valid_from: str
     valid_to: str            # ISO timestamp or "" for open ended
+    status_changed_at: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -38,8 +40,10 @@ class KeyRecord:
             "created_at": self.created_at,
             "status": self.status,
             "scope": self.scope,
+            "role": self.role,
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
+            "status_changed_at": self.status_changed_at,
         }
 
     @staticmethod
@@ -51,8 +55,10 @@ class KeyRecord:
             created_at=d["created_at"],
             status=d["status"],
             scope=d["scope"],
+            role=d.get("role", ""),
             valid_from=d["valid_from"],
             valid_to=d.get("valid_to", ""),
+            status_changed_at=d.get("status_changed_at", ""),
         )
 
 
@@ -106,6 +112,7 @@ class IssuerKeyStore:
         scope: str,
         now: str,
         valid_to: str = "",
+        role: str = "",
     ) -> KeyRecord:
         """Rotate in a new active key; the previous one becomes 'rotated'."""
         records = self._read()
@@ -116,6 +123,7 @@ class IssuerKeyStore:
         for d in records:
             if d["issuer_id"] == issuer_id and d["status"] == "active":
                 d["status"] = "rotated"
+                d["status_changed_at"] = now
         seed, pub = ed25519.generate_keypair()
         with open(self._secret_path(issuer_id, new_version), "wb") as f:
             f.write(seed)
@@ -129,15 +137,18 @@ class IssuerKeyStore:
             created_at=now,
             status="active",
             scope=scope,
+            role=role,
             valid_from=now,
             valid_to=valid_to,
+            status_changed_at=now,
         )
         records.append(rec.to_dict())
         self._write(records)
         return rec
 
     def set_status(
-        self, issuer_id: str, key_version: int, status: str
+        self, issuer_id: str, key_version: int, status: str,
+        status_changed_at: str = "",
     ) -> KeyRecord:
         if status not in ("active", "rotated", "revoked"):
             raise ValueError(f"bad status {status}")
@@ -146,6 +157,7 @@ class IssuerKeyStore:
         for d in records:
             if d["issuer_id"] == issuer_id and d["key_version"] == key_version:
                 d["status"] = status
+                d["status_changed_at"] = status_changed_at
                 found = True
         if not found:
             raise KeyError(f"key {issuer_id} v{key_version} not found")
