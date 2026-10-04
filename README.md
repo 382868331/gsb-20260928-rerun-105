@@ -142,6 +142,33 @@ python -m trusted_release --home store collection-list
 集合记录存储在 `registry/collections/<collection_release_id>.json`，
 目录条目追加在 `index.json` 的 `collections` 列表中。
 
+## 发布集合版本对照报告（Collection Compare）
+
+审批人员选择两个已发布集合，`collection-compare` 生成一份自包含、可离线
+保存的对照报告（`trusted_release/compare.py`）：
+
+- **制品内容变化**：新增 / 移除 / 替换了哪些成员（制品哈希与构建说明哈希
+  分别标注），哪些成员保持不变；
+- **依赖关系变化**：新增 / 移除的依赖边、两侧的共享依赖与循环依赖；
+- **所需批准角色变化**：策略 id/版本与各角色所需批准数量的逐项差异；
+- **批准逐项解释**：旧集合的每一份批准为何不再适用于新集合（批准绑定
+  旧 `candidate_digest` / `policy_digest`），以及新集合每个角色还需
+  补齐多少份绑定新候选的批准、旧集合中该角色的批准人是谁。
+
+报告通过 `old` / `new` 两个摘要（`collection_release_id`、`spec_digest`、
+`candidate_digest`、`policy_digest`、`record_id`）关联到两个集合，并自带
+`report_id`。报告**只读**：不自动继承任何批准到新集合，也不改写两个已
+发布集合的记录；生成前后两个集合均可独立核验。
+
+```bash
+python -m trusted_release --home store collection-compare \
+    --old rel-v1.json --new rel-v2.json --output compare-report.json
+```
+
+`--old` / `--new` 接受发布包路径或 `collection_release_id`（从仓库读取）。
+完整演示（共享依赖、循环依赖、单个制品替换）见
+`examples/demo_collection_compare.sh`。
+
 
 `trusted_release/ed25519.py` 为 RFC 8032 Ed25519 纯标准库实现，
 已通过 RFC 8032 测试向量并与系统 OpenSSL 做签名互操作校验。

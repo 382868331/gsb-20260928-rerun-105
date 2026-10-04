@@ -363,6 +363,50 @@ def cmd_collection_verify(args) -> int:
             print(f"  - {e}")
     return 0 if result.ok else 3
 
+
+
+def _load_collection_arg(reg: Registry, ref: str) -> dict:
+    """Load a collection record from a bundle path or a release id."""
+    if os.path.exists(ref):
+        return load_bundle(ref)
+    return reg.read_collection(ref)
+
+
+def cmd_collection_compare(args) -> int:
+    from .compare import compare_collections
+
+    reg = Registry(os.path.join(args.home, "registry"))
+    old_record = _load_collection_arg(reg, args.old)
+    new_record = _load_collection_arg(reg, args.new)
+    try:
+        report = compare_collections(
+            old_record, new_record, now=args.now or utc_now())
+    except ValueError as exc:
+        print(f"compare failed: {exc}", file=sys.stderr)
+        return 3
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False, sort_keys=True)
+        print(f"report_id={report['report_id']} saved to {args.output}")
+    if args.json or not args.output:
+        print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        old, new = report["old"], report["new"]
+        print(f"compare {old['collection_release_id']} -> "
+              f"{new['collection_release_id']}")
+        cc = report["content_changes"]
+        print(f"  members: +{len(cc['added'])} -{len(cc['removed'])} "
+              f"~{len(cc['replaced'])} ={len(cc['unchanged'])}")
+        dc = report["dependency_changes"]
+        print(f"  dependency edges: +{len(dc['added_edges'])} "
+              f"-{len(dc['removed_edges'])}; "
+              f"cycles old={len(dc['cycles_old'])} new={len(dc['cycles_new'])}")
+        aa = report["approval_analysis"]
+        print(f"  stale approvals: {len(aa['stale_approvals'])}; "
+              f"roles to collect: {len(aa['approvals_to_collect'])}")
+        for line in aa["explanations"]:
+            print(f"  - {line}")
+    return 0
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="trusted-release")
     p.add_argument("--home", default=".release-store", help="store home dir")
@@ -491,6 +535,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--now", default="")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_collection_verify)
+
+    s = sub.add_parser("collection-compare")
+    s.add_argument("--old", required=True,
+                   help="old collection bundle path or collection_release_id")
+    s.add_argument("--new", required=True,
+                   help="new collection bundle path or collection_release_id")
+    s.add_argument("--output", default="",
+                   help="write the report JSON to this file for offline keeping")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_collection_compare)
 
     return p
 
