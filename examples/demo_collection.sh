@@ -90,7 +90,30 @@ if $TR collection-finalize --candidate $WORK/candidate2.json \
   echo "UNEXPECTED: stale approvals accepted for new collection"; exit 1
 fi
 
-echo "== 8. 旧集合仍然可核验 =="
-$TR collection-verify --bundle $WORK/rel.json
-echo "DEMO OK"
+echo "== 8. 离线版本对照：制品/依赖/角色变化、旧批准为何不适用及需补齐批准 =="
+$TR collection-diff --old-bundle $WORK/rel.json \
+  --new-bundle $WORK/candidate2.json --output $WORK/report-before-finalize.json
+python - <<'EOF'
+import json
+r = json.load(open('/tmp/tr-collection-demo/work/report-before-finalize.json'))
+assert r['content_changes']['replaced'][0]['member'] == 'app:2.0'
+assert any(x['member'] == 'lib:1.3' for x in r['dependency_changes']['shared_dependencies'])
+assert all(not x['applicable_to_new_collection']
+           for x in r['old_approval_assessment'])
+assert {x['role']: x['missing_new_approvals']
+        for x in r['required_new_approvals']} == {'build': 1, 'qa': 1}
+print("approval gaps: build=1 qa=1; old approvals inherited=0")
+EOF
 
+echo "== 9. 对新候选重新取得批准并发布；报告未继承旧批准也未改写旧集合 =="
+$TR collection-approve --candidate $WORK/candidate2.json --issuer build2 --output $WORK/build2-v2.json
+$TR collection-approve --candidate $WORK/candidate2.json --issuer qa --output $WORK/qa-v2.json
+$TR collection-finalize --candidate $WORK/candidate2.json \
+  --approvals $WORK/build2-v2.json $WORK/qa-v2.json --bundle $WORK/rel2.json
+$TR collection-diff --old-bundle $WORK/rel.json \
+  --new-bundle $WORK/rel2.json --output $WORK/report-released.json
+
+echo "== 10. 旧集合仍然可核验 =="
+$TR collection-verify --bundle $WORK/rel.json
+$TR collection-verify --bundle $WORK/rel2.json
+echo "DEMO OK"

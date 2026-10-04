@@ -11,6 +11,7 @@ from trusted_release import (
     Verifier,
 )
 from trusted_release.collection import find_cycles, validate_spec
+from trusted_release.collection_report import build_collection_comparison
 from trusted_release.policy import ReleasePolicy
 
 NOW = "2026-01-01T00:00:00Z"
@@ -270,3 +271,84 @@ def test_offline_verify_reports_exactly_what_is_missing(store):
     assert not result.ok
     assert any("role qa" in e for e in result.errors)
 
+
+def test_collection_comparison_reports_content_dependencies_and_approval_gaps(store):
+    tmp_path, reg, keys, crl, files = store
+    old_candidate = _candidate(store)
+    old_record = _finalize(
+        store, old_candidate,
+        [_approve(store, old_candidate, "build"),
+         _approve(store, old_candidate, "qa")],
+    )
+
+    replaced = tmp_path / "app-2.0-hotfix.tar"
+    replaced.write_bytes(b"app binary v2 HOTFIX")
+    files["app"] = (str(replaced), files["app"][1])
+    new_candidate = _candidate(store)
+
+    report = build_collection_comparison(old_record, new_candidate)
+    assert report["old_collection"]["collection_release_id"] == (
+        old_record["collection_release_id"]
+    )
+    assert report["new_collection"]["kind"] == "collection_candidate"
+    assert report["new_collection"]["spec_digest"] == new_candidate["spec_digest"]
+
+    replacements = report["content_changes"]["replaced"]
+    assert [item["member"] for item in replacements] == ["app:2.0"]
+    assert replacements[0]["changed_fields"] == ["artifact_digest"]
+    assert any(item["member"] == "lib:1.3"
+               for item in report["content_changes"]["unchanged"])
+
+    shared = report["dependency_changes"]["shared_dependencies"]
+    assert any(item["member"] == "lib:1.3" and
+               item["depended_on_by"] == ["app:2.0", "plugA:1.0"]
+               for item in shared)
+    assert any("plugA:1.0" in cycle and "plugB:1.0" in cycle
+               for cycle in report["dependency_changes"]["new_cycles"])
+
+    assessed = report["old_approval_assessment"]
+    assert {item["role"] for item in assessed} == {"build", "qa"}
+    assert all(not item["applicable_to_new_collection"] for item in assessed)
+    assert all(item["carryover_count"] == 0 for item in assessed)
+    gaps = {item["role"]: item for item in report["required_new_approvals"]}
+    assert gaps["build"]["missing_new_approvals"] == 1
+    assert gaps["qa"]["missing_new_approvals"] == 1
+    assert gaps["build"]["usable_old_approvals"] == 0
+    assert not report["inheritance"]["published_collections_modified"]
+
+    # The old published record remains byte-for-byte intact and verifiable.
+    assert Verifier(keys, crl).verify_collection(
+        old_record, resolve_content=_resolver(reg), now=LATER
+    ).ok
+
+
+def test_collection_comparison_between_two_releases_does_not_inherit_approvals(store):
+    _, reg, keys, crl, files = store
+    old_candidate = _candidate(store)
+    old_record = _finalize(
+        store, old_candidate,
+        [_approve(store, old_candidate, "build"),
+         _approve(store, old_candidate, "qa")],
+    )
+
+    # A new release gets fresh approvals on its own new candidate.
+    members = _members(files)
+    members[0]["depends_on"] = []
+    new_candidate = _candidate(store, members=members)
+    new_record = _finalize(
+        store, new_candidate,
+        [_approve(store, new_candidate, "build"),
+         _approve(store, new_candidate, "qa")],
+    )
+    report = build_collection_comparison(old_record, new_record)
+    assert report["dependency_changes"]["removed"] == [
+        {"from": "app:2.0", "to": "lib:1.3"}
+    ]
+    assert all(not item["applicable_to_new_collection"]
+               for item in report["old_approval_assessment"])
+    assert all(item["missing_new_approvals"] == 0
+               for item in report["required_new_approvals"])
+    assert len(reg.read_index()["collections"]) == 2
+    assert Verifier(keys, crl).verify_collection(
+        old_record, resolve_content=_resolver(reg), now=LATER
+    ).ok

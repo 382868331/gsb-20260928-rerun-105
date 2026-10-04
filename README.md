@@ -120,6 +120,11 @@ python -m trusted_release --home store crl-list  # 撤销资料历史版本
 - **离线核验与缺失定位**：接收者只需集合发布包、成员内容与当前信任库。
   collection-verify 逐项报告缺失的可信依据（哪个成员内容缺失、哪个
   角色批准不足、哪份批准因撤销/轮换不再计数），详见 checks.missing_trust。
+- **版本对照报告**：审批人员可选择两个已发布集合，或一个已发布集合与一个
+  新候选，生成自包含、可离线保存的 JSON 报告。报告同时嵌入两个集合摘要，
+  逐项比较成员制品/构建说明哈希、依赖边、共享依赖、循环依赖与策略角色；
+  每份旧批准都会标明仅绑定旧 candidate/spec/policy digest，不能由新集合继承。
+  报告是只读操作：不会把旧批准写入候选，不会发布或改写任何已发布集合。
 
 ```bash
 python -m trusted_release --home store collection-candidate \
@@ -134,10 +139,14 @@ python -m trusted_release --home store collection-finalize \
     --candidate candidate.json --approvals build.json qa.json --bundle rel.json
 python -m trusted_release --home store collection-verify --bundle rel.json --json
 python -m trusted_release --home store collection-list
+python -m trusted_release --home store collection-diff \
+    --old-bundle rel-v1.json --new-bundle candidate-v2.json \
+    --output collection-diff-v1-v2.json
 ```
 
 完整演示（共享依赖、循环依赖、部分批准、撤销后重新解释、中断接续、
-离线核验与缺失定位）见 `examples/demo_collection.sh`。
+单个制品替换、版本对照报告、离线核验与缺失定位）见
+`examples/demo_collection.sh`。
 
 集合记录存储在 `registry/collections/<collection_release_id>.json`，
 目录条目追加在 `index.json` 的 `collections` 列表中。

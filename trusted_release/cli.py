@@ -12,6 +12,7 @@ import os
 import sys
 
 from .attestation import RevocationList, verify_signature
+from .collection_report import build_collection_comparison
 from .issuer import IssuerKeyStore
 from .publisher import Publisher, utc_now
 from .registry import Registry
@@ -363,6 +364,38 @@ def cmd_collection_verify(args) -> int:
             print(f"  - {e}")
     return 0 if result.ok else 3
 
+
+def _load_collection_selection(reg: Registry, *, bundle: str, release_id: str) -> dict:
+    if bool(bundle) == bool(release_id):
+        raise SystemExit("specify exactly one of bundle path and collection release id")
+    if bundle:
+        return load_bundle(bundle)
+    return reg.read_collection(release_id)
+
+
+def cmd_collection_diff(args) -> int:
+    reg = Registry(os.path.join(args.home, "registry"))
+    old_bundle = _load_collection_selection(
+        reg, bundle=args.old_bundle, release_id=args.old_collection_release_id
+    )
+    new_bundle = _load_collection_selection(
+        reg, bundle=args.new_bundle, release_id=args.new_collection_release_id
+    )
+    try:
+        report = build_collection_comparison(old_bundle, new_bundle)
+    except ValueError as exc:
+        print(f"collection comparison failed: {exc}", file=sys.stderr)
+        return 3
+    text = json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n")
+        print(f"report_digest={report['report_digest']} output={args.output}")
+    else:
+        print(text)
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="trusted-release")
     p.add_argument("--home", default=".release-store", help="store home dir")
@@ -491,6 +524,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--now", default="")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_collection_verify)
+
+    s = sub.add_parser("collection-diff")
+    s.add_argument("--old-bundle", default="")
+    s.add_argument("--new-bundle", default="")
+    s.add_argument("--old-collection-release-id", default="")
+    s.add_argument("--new-collection-release-id", default="")
+    s.add_argument("--output", default="", help="offline report JSON path")
+    s.set_defaults(func=cmd_collection_diff)
 
     return p
 
