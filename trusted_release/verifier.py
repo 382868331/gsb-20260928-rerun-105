@@ -442,7 +442,226 @@ class Verifier:
         return VerificationResult(not errors, rid, errors, checks)
 
 
+    def verify_collection(
+        self,
+        record: dict,
+        *,
+        resolve_content,
+        now: str,
+        as_of: str = "current",
+        expected_name: str | None = None,
+    ) -> VerificationResult:
+        """Verify a whole release collection under current trust conditions.
+
+        resolve_content(digest) -> path or None locates member bytes for
+        the offline receiver. The result lists exactly which trust basis
+        is missing: absent member content, dangling dependency edges,
+        revoked/rotated approver keys, or unmet policy roles.
+        """
+        import base64
+
+        from . import collection as coll
+
+        rid = record.get("collection_release_id", "?")
+        errors: list[str] = []
+        checks: dict = {}
+        if record.get("type") != coll.RELEASE_TYPE:
+            return VerificationResult(
+                False, rid, [f"not a collection release: {record.get('type')!r}"], {}
+            )
+        candidate = record.get("candidate", {})
+        spec = record.get("spec", candidate.get("spec", {}))
+
+        try:
+            policy = ReleasePolicy.from_dict(
+                record.get("policy", candidate.get("policy", {}))
+            )
+        except Exception as exc:
+            return VerificationResult(
+                False, rid, [f"invalid release policy: {exc}"], {}
+            )
+        policy_data = policy.to_dict()
+        if candidate.get("policy") != policy_data or record.get("policy") != policy_data:
+            errors.append("policy mismatch: release and candidate policies differ")
+        if (
+            record.get("policy_digest") != policy.digest
+            or candidate.get("policy_digest") != policy.digest
+        ):
+            errors.append("policy digest mismatch")
+
+        # ---------- collection spec integrity ----------
+        actual_spec_digest = coll.spec_digest(spec) if spec.get("members") else ""
+        spec_ok = (
+            actual_spec_digest == record.get("spec_digest")
+            == candidate.get("spec_digest")
+        )
+        checks["spec_digest"] = {
+            "expected": record.get("spec_digest"),
+            "actual": actual_spec_digest,
+            "ok": spec_ok,
+        }
+        if not spec_ok:
+            errors.append("collection spec digest mismatch (spec tampered)")
+        spec_errors = coll.validate_spec(spec)
+        errors.extend(spec_errors)
+        cycles = coll.find_cycles(spec) if not spec_errors else []
+        checks["dependency_cycles"] = cycles
+
+        expected_candidate_digest = canonical_hash(
+            {
+                "spec": coll.build_spec(
+                    name=spec.get("name", ""),
+                    version=spec.get("version", ""),
+                    members=spec.get("members", []),
+                ),
+                "policy": policy_data,
+                "nonce": candidate.get("nonce"),
+            }
+        )
+        if (
+            candidate.get("candidate_digest") != expected_candidate_digest
+            or record.get("candidate_digest") != expected_candidate_digest
+        ):
+            errors.append("candidate digest mismatch")
+        if expected_name is not None and record.get("name") != expected_name:
+            errors.append(
+                f"collection name mismatch: expected {expected_name}, "
+                f"attested {record.get('name')}"
+            )
+
+        # ---------- member content ----------
+        missing: list[str] = []
+        member_checks = []
+        members_ok = True
+        for m in spec.get("members", []):
+            label = f"{m.get('product')}:{m.get('version')}"
+            entry = {"member": label, "artifact_ok": False,
+                     "build_spec_ok": False, "reasons": []}
+            for field, key in (("artifact_digest", "artifact_ok"),
+                               ("build_spec_digest", "build_spec_ok")):
+                digest = m.get(field, "")
+                path = resolve_content(digest)
+                if path is None:
+                    entry["reasons"].append(f"content missing for {field} {digest}")
+                    missing.append(f"member {label} {field} not present locally")
+                    continue
+                actual = file_digest(path)
+                if actual != digest:
+                    entry["reasons"].append(
+                        f"{field} mismatch: expected {digest}, got {actual}"
+                    )
+                else:
+                    entry[key] = True
+            if entry["reasons"]:
+                members_ok = False
+                errors.append(f"member {label}: " + "; ".join(entry["reasons"]))
+            member_checks.append(entry)
+        checks["members"] = member_checks
+
+        # ---------- approvals re-interpreted under current trust ----------
+        effective_now = record.get("released_at", now) if as_of == "release" else now
+        revoked, crl_version = self._crl_for(record, effective_now, as_of, errors)
+        approval_checks = []
+        counted = {role: set() for role in policy.requirements}
+        seen_issuers: set[str] = set()
+        envelopes = sorted(
+            record.get("approvals", []), key=lambda x: x.get("approval_id", "")
+        )
+        for envelope in envelopes:
+            approval = envelope.get("approval", {})
+            issuer_id = approval.get("issuer_id")
+            key_version = approval.get("key_version")
+            check = {"approval_id": envelope.get("approval_id", ""),
+                     "issuer": issuer_id, "key_version": key_version,
+                     "role": approval.get("role"), "ok": False,
+                     "counted": False, "reasons": []}
+            key = None
+            try:
+                key = self.keys.get_key(issuer_id, int(key_version))
+            except Exception as exc:
+                check["reasons"].append(f"key not found: {exc}")
+            if key is not None:
+                sig_ok = verify_signature(
+                    approval, envelope.get("signature", ""),
+                    base64.b64decode(key.public_key),
+                )
+                check["signature_ok"] = sig_ok
+                if not sig_ok:
+                    check["reasons"].append("signature verification failed")
+                if not self._key_status_ok(key, effective_now, as_of):
+                    check["reasons"].append(
+                        f"not currently trusted (status={key.status})"
+                    )
+                n = self._parse_ts(effective_now)
+                if key.valid_from and self._parse_ts(key.valid_from) > n:
+                    check["reasons"].append("key not yet valid")
+                if key.valid_to and self._parse_ts(key.valid_to) <= n:
+                    check["reasons"].append("key applicability window has ended")
+                if approval.get("not_before") and n < self._parse_ts(approval["not_before"]):
+                    check["reasons"].append("approval not yet valid")
+                if approval.get("expires_at") and n >= self._parse_ts(approval["expires_at"]):
+                    check["reasons"].append("approval expired")
+                if int(key_version) in revoked.get(issuer_id, []):
+                    check["reasons"].append(f"revoked by CRL v{crl_version}")
+                if key.scope != approval.get("scope") or not scope_covers(
+                    key.scope, record.get("name", "")
+                ):
+                    check["reasons"].append("scope mismatch")
+                if key.role != approval.get("role"):
+                    check["reasons"].append("role mismatch")
+            bindings = {
+                "candidate_id": candidate.get("candidate_id"),
+                "candidate_digest": candidate.get("candidate_digest"),
+                "collection_release_id": record.get("collection_release_id"),
+                "name": record.get("name"),
+                "version": record.get("version"),
+                "spec_digest": record.get("spec_digest"),
+                "policy_id": policy.policy_id,
+                "policy_version": policy.policy_version,
+                "policy_digest": policy.digest,
+            }
+            for field_name, expected in bindings.items():
+                if approval.get(field_name) != expected:
+                    check["reasons"].append(f"approval binding mismatch: {field_name}")
+            if issuer_id in seen_issuers:
+                check["reasons"].append("duplicate issuer cannot be counted twice")
+            if approval.get("role") not in policy.requirements:
+                check["reasons"].append("role not required by policy")
+            check["ok"] = not check["reasons"]
+            if check["ok"] and issuer_id not in seen_issuers:
+                counted[approval["role"]].add(issuer_id)
+                check["counted"] = True
+            seen_issuers.add(issuer_id)
+            approval_checks.append(check)
+        counts = {role: len(issuers) for role, issuers in counted.items()}
+        for role, required in policy.requirements.items():
+            if counts.get(role, 0) < required:
+                msg = (
+                    f"insufficient valid distinct issuers for role {role}: "
+                    f"have {counts.get(role, 0)}, need {required}"
+                )
+                errors.append(msg)
+                missing.append(msg)
+                for check in approval_checks:
+                    if not check["ok"]:
+                        missing.append(
+                            f"approval from {check['issuer']} not counted: "
+                            + "; ".join(check["reasons"])
+                        )
+        checks.update({
+            "approvals": approval_checks,
+            "approval_counts": counts,
+            "policy_requirements": policy.requirements,
+            "crl_version": crl_version,
+            "missing_trust": missing,
+        })
+        ok = not errors and members_ok
+        return VerificationResult(ok, rid, errors, checks)
+
+
 def export_bundle(release_record: dict, path: str) -> None:
+
+
     """Export a self-contained release attestation bundle for offline use."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(release_record, f, indent=2, ensure_ascii=False, sort_keys=True)

@@ -212,6 +212,157 @@ def cmd_verify(args) -> int:
     return 0 if result.ok else 3
 
 
+def _parse_member(spec: str) -> dict:
+    # product:version:artifact_path:build_spec_path
+    parts = spec.split(":")
+    if len(parts) != 4:
+        raise SystemExit(
+            f"bad --member {spec!r}; want product:version:artifact:build_spec"
+        )
+    return {
+        "product": parts[0],
+        "version": parts[1],
+        "artifact_path": parts[2],
+        "build_spec_path": parts[3],
+        "depends_on": [],
+    }
+
+
+def _parse_dep(spec: str) -> tuple[tuple[str, str], dict]:
+    # product:version=dep_product:dep_version
+    left, _, right = spec.partition("=")
+    lp, _, lv = left.partition(":")
+    dp, _, dv = right.partition(":")
+    if not all([lp, lv, dp, dv]):
+        raise SystemExit(
+            f"bad --dep {spec!r}; want product:version=dep_product:dep_version"
+        )
+    return (lp, lv), {"product": dp, "version": dv}
+
+
+def cmd_collection_candidate(args) -> int:
+    reg = Registry(os.path.join(args.home, "registry"))
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    members = {}
+    for m in args.member:
+        parsed = _parse_member(m)
+        members[(parsed["product"], parsed["version"])] = parsed
+    for d in args.dep or []:
+        src, dep = _parse_dep(d)
+        if src not in members:
+            raise SystemExit(f"--dep source {src[0]}:{src[1]} is not a member")
+        members[src]["depends_on"].append(dep)
+    requirements = {}
+    for item in args.require:
+        role, count = item.split("=", 1)
+        requirements[role] = int(count)
+    candidate = Publisher(reg, keys).create_collection_candidate(
+        name=args.name,
+        version=args.version,
+        members=list(members.values()),
+        policy=ReleasePolicy(args.policy_id, args.policy_version, requirements),
+        now=args.now or utc_now(),
+    )
+    with open(args.bundle, "w", encoding="utf-8") as f:
+        json.dump(candidate, f, indent=2, ensure_ascii=False, sort_keys=True)
+    print(f"candidate_id={candidate['candidate_id']} bundle={args.bundle}")
+    return 0
+
+
+def cmd_collection_approve(args) -> int:
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    with open(args.candidate, "r", encoding="utf-8") as f:
+        candidate = json.load(f)
+    approval = Publisher(
+        Registry(os.path.join(args.home, "registry")), keys
+    ).approve_collection(
+        candidate, issuer_id=args.issuer, now=args.now or utc_now(),
+        validity_days=args.validity_days,
+    )
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(approval, f, indent=2, ensure_ascii=False, sort_keys=True)
+    print(f"approval_id={approval['approval_id']} output={args.output}")
+    return 0
+
+
+def cmd_collection_finalize(args) -> int:
+    reg = Registry(os.path.join(args.home, "registry"))
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    crl = RevocationList(os.path.join(args.home, "crl"))
+    with open(args.candidate, "r", encoding="utf-8") as f:
+        candidate = json.load(f)
+    approvals = [load_bundle(path) for path in args.approvals]
+    try:
+        record = Publisher(reg, keys, crl).finalize_collection(
+            candidate, approvals, now=args.now or utc_now())
+    except ValueError as exc:
+        print(f"finalize failed: {exc}", file=sys.stderr)
+        return 3
+    with open(args.bundle, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False, sort_keys=True)
+    print(
+        f"published collection_release_id={record['collection_release_id']} "
+        f"bundle={args.bundle}"
+    )
+    return 0
+
+
+def cmd_collection_list(args) -> int:
+    reg = Registry(os.path.join(args.home, "registry"))
+    idx = reg.read_index()
+    for entry in idx.get("collections", []):
+        print(json.dumps(entry, sort_keys=True))
+    print(f"total={len(idx.get('collections', []))}", file=sys.stderr)
+    return 0
+
+
+def cmd_collection_verify(args) -> int:
+    keys = IssuerKeyStore(os.path.join(args.home, "issuers"))
+    crl = RevocationList(os.path.join(args.home, "crl"))
+    reg = Registry(os.path.join(args.home, "registry"))
+    verifier = Verifier(keys, crl, TrustPolicy(trust_rotated=args.trust_rotated))
+    if args.bundle:
+        record = load_bundle(args.bundle)
+    else:
+        record = reg.read_collection(args.collection_release_id)
+
+    extra_dirs = args.content_dir or []
+
+    def resolve(digest: str):
+        stored = reg.artifact_path(digest)
+        if os.path.exists(stored):
+            return stored
+        algo, _, hexpart = digest.partition(":")
+        for d in extra_dirs:
+            for name in (hexpart, digest.replace(":", "_")):
+                candidate = os.path.join(d, name)
+                if os.path.exists(candidate):
+                    return candidate
+        return None
+
+    result = verifier.verify_collection(
+        record,
+        resolve_content=resolve,
+        now=args.now or utc_now(),
+        expected_name=args.name,
+        as_of="release" if args.as_of_release else "current",
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {"ok": result.ok, "collection_release_id": result.release_id,
+                 "errors": result.errors, "checks": result.checks},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        status = "TRUSTED" if result.ok else "UNTRUSTED"
+        print(f"{status} collection={result.release_id}")
+        for e in result.errors:
+            print(f"  - {e}")
+    return 0 if result.ok else 3
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="trusted-release")
     p.add_argument("--home", default=".release-store", help="store home dir")
@@ -285,6 +436,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_crl_list)
 
     s = sub.add_parser("verify")
+
+
     s.add_argument("--artifact", required=True)
     s.add_argument("--build-spec", default="")
     s.add_argument("--release-id", default="")
@@ -295,6 +448,50 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--now", default="")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_verify)
+    s = sub.add_parser("collection-candidate")
+    s.add_argument("--name", required=True)
+    s.add_argument("--version", required=True)
+    s.add_argument("--member", action="append", required=True,
+                   help="product:version:artifact_path:build_spec_path")
+    s.add_argument("--dep", action="append", default=[],
+                   help="product:version=dep_product:dep_version")
+    s.add_argument("--policy-id", required=True)
+    s.add_argument("--policy-version", type=int, required=True)
+    s.add_argument("--require", action="append", required=True)
+    s.add_argument("--bundle", required=True)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_collection_candidate)
+
+    s = sub.add_parser("collection-approve")
+    s.add_argument("--candidate", required=True)
+    s.add_argument("--issuer", required=True)
+    s.add_argument("--output", required=True)
+    s.add_argument("--validity-days", type=int, default=365)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_collection_approve)
+
+    s = sub.add_parser("collection-finalize")
+    s.add_argument("--candidate", required=True)
+    s.add_argument("--approvals", nargs="+", required=True)
+    s.add_argument("--bundle", required=True)
+    s.add_argument("--now", default="")
+    s.set_defaults(func=cmd_collection_finalize)
+
+    s = sub.add_parser("collection-list")
+    s.set_defaults(func=cmd_collection_list)
+
+    s = sub.add_parser("collection-verify")
+    s.add_argument("--collection-release-id", default="")
+    s.add_argument("--bundle", default="")
+    s.add_argument("--content-dir", action="append", default=[],
+                   help="extra dir with member content named by digest")
+    s.add_argument("--name", default=None)
+    s.add_argument("--trust-rotated", action="store_true")
+    s.add_argument("--as-of-release", action="store_true")
+    s.add_argument("--now", default="")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_collection_verify)
+
     return p
 
 

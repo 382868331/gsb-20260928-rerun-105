@@ -98,6 +98,51 @@ python -m trusted_release --home store crl-list  # 撤销资料历史版本
 
 ## 密码学说明
 
+## 发布集合（Release Collections）
+
+一次发布常包含彼此依赖的多个制品。**发布集合**把一组明确的制品版本
+连同它们之间的依赖声明一起固定进一份集合规格（spec），审批与验证都
+覆盖集合整体，而不是分别批准后任意拼装：
+
+- **整体批准**：批准签名绑定候选 digest，而候选 digest 覆盖集合规格
+  （全部成员制品哈希 + 构建说明哈希 + 依赖声明）与完整策略版本。
+  集合内替换任何一个制品、构建说明或依赖说明都会得到新候选，
+  旧批准对新集合一律不再适用。
+- **依赖图**：成员用 depends_on 声明对本集合内其他成员的版本钉扎；
+  允许共享依赖（多个成员依赖同一成员）与循环依赖（A↔B），
+  但任何指向集合外的依赖都会在结构校验时被拒绝。
+- **部分批准与重新解释**：签发者可以先后各自批准，批准是可独立保存
+  的文件。finalize 时按**当前**信任库与当前 CRL 重新解释每一份批准
+  ——收集期间策略版本变化（批准绑定 policy_digest）或签发者被撤销，
+  都会使相应批准不再计数；补齐可信批准后可接续 finalize。
+- **原子进入可信目录**：集合记录先落盘为不可变文件，index.json 最后
+  原子追加；finalize 失败或中断不会暴露半份集合，旧集合继续可核验。
+- **离线核验与缺失定位**：接收者只需集合发布包、成员内容与当前信任库。
+  collection-verify 逐项报告缺失的可信依据（哪个成员内容缺失、哪个
+  角色批准不足、哪份批准因撤销/轮换不再计数），详见 checks.missing_trust。
+
+```bash
+python -m trusted_release --home store collection-candidate \
+    --name platform --version 2026.10 \
+    --member app:2.0:app.tar:APP.BUILD --member lib:1.3:lib.tar:LIB.BUILD \
+    --dep app:2.0=lib:1.3 \
+    --policy-id standard --policy-version 1 --require build=1 --require qa=1 \
+    --bundle candidate.json
+python -m trusted_release --home store collection-approve \
+    --candidate candidate.json --issuer build --output build.json
+python -m trusted_release --home store collection-finalize \
+    --candidate candidate.json --approvals build.json qa.json --bundle rel.json
+python -m trusted_release --home store collection-verify --bundle rel.json --json
+python -m trusted_release --home store collection-list
+```
+
+完整演示（共享依赖、循环依赖、部分批准、撤销后重新解释、中断接续、
+离线核验与缺失定位）见 `examples/demo_collection.sh`。
+
+集合记录存储在 `registry/collections/<collection_release_id>.json`，
+目录条目追加在 `index.json` 的 `collections` 列表中。
+
+
 `trusted_release/ed25519.py` 为 RFC 8032 Ed25519 纯标准库实现，
 已通过 RFC 8032 测试向量并与系统 OpenSSL 做签名互操作校验。
 生产环境可将该模块替换为原生/库实现，接口保持不变。

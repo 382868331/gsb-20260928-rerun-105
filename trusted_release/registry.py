@@ -28,7 +28,8 @@ class Registry:
         self.art_dir = os.path.join(root, "artifacts")
         self.man_dir = os.path.join(root, "manifests")
         self.rel_dir = os.path.join(root, "releases")
-        for d in (self.art_dir, self.man_dir, self.rel_dir):
+        self.col_dir = os.path.join(root, "collections")
+        for d in (self.art_dir, self.man_dir, self.rel_dir, self.col_dir):
             os.makedirs(d, exist_ok=True)
         self.index_path = os.path.join(root, INDEX_FILE)
         if not os.path.exists(self.index_path):
@@ -171,4 +172,47 @@ class Registry:
     def list_release_ids(self) -> list[str]:
         return sorted(
             f[:-5] for f in os.listdir(self.rel_dir) if f.endswith(".json")
+        )
+
+    # ---------- collection index ----------
+    def index_collection(self, record: dict) -> None:
+        """Append a fully approved collection to the trusted catalog.
+
+        The immutable collection record is written first; the index is
+        updated last and atomically, so an interrupted finalize can never
+        expose half a collection. Old collections stay indexed and
+        verifiable.
+        """
+        idx = self.read_index()
+        collections = idx.setdefault("collections", [])
+        rid = record["collection_release_id"]
+        for entry in collections:
+            if entry["collection_release_id"] == rid:
+                raise ValueError(f"collection {rid} already indexed")
+        col_path = os.path.join(self.col_dir, rid + ".json")
+        if not os.path.exists(col_path):
+            self._atomic_json(col_path, record)
+        collections.append(
+            {
+                "collection_release_id": rid,
+                "name": record["name"],
+                "version": record["version"],
+                "spec_digest": record["spec_digest"],
+                "member_count": len(record["spec"]["members"]),
+                "policy_id": record["policy"]["policy_id"],
+                "policy_version": record["policy"]["policy_version"],
+                "approval_count": len(record.get("approvals", [])),
+                "released_at": record.get("released_at", ""),
+            }
+        )
+        self._write_index(idx)
+
+    def read_collection(self, collection_release_id: str) -> dict:
+        path = os.path.join(self.col_dir, collection_release_id + ".json")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def list_collection_ids(self) -> list[str]:
+        return sorted(
+            f[:-5] for f in os.listdir(self.col_dir) if f.endswith(".json")
         )
