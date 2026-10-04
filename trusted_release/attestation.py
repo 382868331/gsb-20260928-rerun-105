@@ -92,6 +92,44 @@ def build_approval(
     }
 
 
+def build_set_approval(
+    *,
+    candidate: dict,
+    issuer_id: str,
+    key_version: int,
+    role: str,
+    scope: str,
+    issued_at: str,
+    expires_at: str,
+    not_before: str,
+) -> dict:
+    """Approval over a whole release set candidate.
+
+    The signed payload binds the set digest (which itself commits to every
+    member digest and every dependency declaration) plus the full policy
+    version, so one approval covers the set as a whole and can never be
+    reused for a modified set.
+    """
+    return {
+        "type": "trusted-release/set-approval/v1",
+        "set_id": candidate["set_id"],
+        "set_digest": candidate["set_digest"],
+        "name": candidate["name"],
+        "set_version": candidate["set_version"],
+        "member_digests": [m["artifact_digest"] for m in candidate["members"]],
+        "policy_id": candidate["policy"]["policy_id"],
+        "policy_version": candidate["policy"]["policy_version"],
+        "policy_digest": candidate["policy_digest"],
+        "issuer_id": issuer_id,
+        "key_version": key_version,
+        "role": role,
+        "scope": scope,
+        "issued_at": issued_at,
+        "not_before": not_before,
+        "expires_at": expires_at,
+    }
+
+
 def verify_signature(attestation: dict, signature_b64: str, public_key: bytes) -> bool:
     try:
         sig = base64.b64decode(signature_b64, validate=True)

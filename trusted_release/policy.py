@@ -11,6 +11,10 @@ CANDIDATE_TYPE = "trusted-release/release-candidate/v1"
 APPROVAL_TYPE = "trusted-release/approval/v1"
 RELEASE_TYPE_V2 = "trusted-release/release/v2"
 
+SET_CANDIDATE_TYPE = "trusted-release/set-candidate/v1"
+SET_APPROVAL_TYPE = "trusted-release/set-approval/v1"
+SET_RELEASE_TYPE = "trusted-release/release-set/v1"
+
 
 @dataclass(frozen=True)
 class ReleasePolicy:

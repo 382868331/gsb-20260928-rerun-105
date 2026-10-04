@@ -44,6 +44,15 @@
 - **发布中断安全**：发布顺序为「登记内容 → 签名 → 最后原子更新索引」。
   任何前置步骤失败都不会向 `index.json` 写入条目，因此失败产物不可能
   被当作可信版本。
+- **发布集合（release set）**：多个相互依赖的制品组成一个集合并整体
+  批准。集合候选 digest 绑定每个成员的制品哈希、构建说明哈希以及
+  全部依赖声明（`depends_on`），因此替换任一制品或改动任一依赖边
+  都会得到全新集合，旧批准自动失效。批准允许先部分收集、稍后补齐；
+  `set-finalize` 在收集完成时按**当前**信任条件重新解释每份批准
+  （策略版本变化、签发者撤销都会立即体现），法定人数满足后整组
+  原子写入可信目录——要么整组出现，要么完全不存在半个集合。
+  依赖声明的是「允许一起使用」而非构建顺序：共享依赖自然表达，
+  循环依赖允许存在并如实报告。历史集合永久保留，旧集合始终可核验。
 
 ## 存储布局
 
@@ -101,6 +110,45 @@ python -m trusted_release --home store crl-list  # 撤销资料历史版本
 `trusted_release/ed25519.py` 为 RFC 8032 Ed25519 纯标准库实现，
 已通过 RFC 8032 测试向量并与系统 OpenSSL 做签名互操作校验。
 生产环境可将该模块替换为原生/库实现，接口保持不变。
+
+## 发布集合（release set）
+
+多个相互依赖的制品组成一个集合，批准覆盖集合整体。集合候选 digest
+绑定每个成员的制品哈希、构建说明哈希与全部依赖声明（`depends_on`），
+替换任一制品或改动任一依赖边都会得到全新集合，旧批准自动失效。
+批准可先部分收集、稍后补齐；`set-finalize` 在收集完成时按**当前**
+信任条件重新解释每份批准（策略版本变化、签发者撤销立即体现），
+法定人数满足后整组原子写入可信目录——要么整组出现，要么不存在
+半个集合。依赖声明的是「允许一起使用」而非构建顺序：共享依赖自然
+表达，循环依赖允许存在并如实报告。历史集合永久保留，旧集合始终
+可核验。
+
+用法（`set-verify` 成功退出码 0，失败 3）：
+
+    python -m trusted_release --home store set-candidate \
+        --name suite --set-version 2026.1 \
+        --member libbase:1.0:libbase.bin:libbase.BUILD \
+        --member app:1.0:app.bin:app.BUILD \
+        --dep app:libbase \
+        --policy-id set-standard --policy-version 1 \
+        --require build=1 --require qa=1 --bundle set-candidate.json
+    python -m trusted_release --home store set-approve \
+        --candidate set-candidate.json --issuer build --output appr-build.json
+    python -m trusted_release --home store set-finalize \
+        --candidate set-candidate.json --approvals appr-build.json appr-qa.json \
+        --bundle set-rel.json
+    python -m trusted_release --home store set-verify \
+        --bundle set-rel.json --member app:app.bin --member libbase:libbase.bin
+
+离线接收者只需发布包、各成员文件与当前信任库；缺少某个成员文件时会
+明确指出缺哪一项可信依据（`missing trusted basis: ... member
+<product>`）。未提供 `--member` 时回退使用本地仓库中按内容寻址存储
+的制品。完整演示见 `examples/release_set_demo.sh`（共享依赖、循环
+依赖、部分批准、中断后接续、撤销重解释、旧集合核验）。
+
+发布集合测试覆盖：共享依赖、循环依赖、缺失依赖声明拒绝、部分批准后
+中断接续、替换成员/改依赖/改策略版本使旧批准失效、收集期间撤销
+重解释、旧集合持续可核验、离线缺成员与成员被替换的明确定位。
 
 ## 测试
 

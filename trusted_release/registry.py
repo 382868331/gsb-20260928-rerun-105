@@ -168,6 +168,53 @@ class Registry:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+    # ---------- release set index ----------
+    def index_set_release(self, record: dict) -> None:
+        """Append a fully approved release set to the trusted catalog.
+
+        The immutable set record is written first; the index is updated
+        last, atomically, in a single write that covers every member.
+        An interrupted finalize therefore can never expose half a set:
+        either the whole set is in the catalog or none of it is.
+        """
+        idx = self.read_index()
+        idx.setdefault("sets", [])
+        for entry in idx["sets"]:
+            if entry["set_id"] == record["set_id"]:
+                raise ValueError(f"set {record['set_id']} already indexed")
+        rel_path = os.path.join(self.rel_dir, record["set_id"] + ".json")
+        if not os.path.exists(rel_path):
+            self._atomic_json(rel_path, record)
+        idx["sets"].append(
+            {
+                "type": "set",
+                "set_id": record["set_id"],
+                "name": record["name"],
+                "set_version": record["set_version"],
+                "set_digest": record["set_digest"],
+                "members": [
+                    {
+                        "product": m["product"],
+                        "version": m["version"],
+                        "artifact_digest": m["artifact_digest"],
+                        "build_spec_digest": m["build_spec_digest"],
+                        "depends_on": list(m.get("depends_on", [])),
+                    }
+                    for m in record["members"]
+                ],
+                "released_at": record.get("released_at", ""),
+                "policy_id": record.get("policy", {}).get("policy_id", ""),
+                "policy_version": record.get("policy", {}).get("policy_version", 0),
+                "approval_count": len(record.get("approvals", [])),
+            }
+        )
+        self._write_index(idx)
+
+    def read_set(self, set_id: str) -> dict:
+        path = os.path.join(self.rel_dir, set_id + ".json")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     def list_release_ids(self) -> list[str]:
         return sorted(
             f[:-5] for f in os.listdir(self.rel_dir) if f.endswith(".json")

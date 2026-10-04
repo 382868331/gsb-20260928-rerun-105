@@ -17,6 +17,7 @@ keys and expired attestations no longer validate.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 from .attestation import verify_signature
@@ -318,7 +319,10 @@ class Verifier:
     def _crl_for(self, record: dict, now: str, as_of: str, errors: list[str]):
         snapshot = self._read_crl_snapshot(now, as_of, record)
         if snapshot is None:
-            if self.crl is not None and self.crl.list_versions():
+            # For historical (as-of-release) evaluation, the absence of any
+            # revocation snapshot at that time simply means nothing was
+            # revoked yet; only the current evaluation requires a snapshot.
+            if as_of == "current" and self.crl is not None and self.crl.list_versions():
                 errors.append("no revocation snapshot available for requested evaluation time")
             return {}, 0
         valid = self._validate_crl_snapshot(snapshot, now, errors, as_of)
@@ -369,11 +373,35 @@ class Verifier:
             errors.append(f"product mismatch: expected {expected_product}, attested {record.get('product')}")
         effective_now = record.get("released_at", now) if as_of == "release" else now
         revoked, crl_version = self._crl_for(record, effective_now, as_of, errors)
+        bindings = {
+            "candidate_id": candidate.get("candidate_id"),
+            "candidate_digest": candidate.get("candidate_digest"),
+            "release_id": record.get("release_id"),
+            "product": record.get("product"),
+            "version": record.get("version"),
+            "artifact_digest": record.get("artifact_digest"),
+            "build_spec_digest": record.get("build_spec_digest"),
+            "policy_id": policy.policy_id,
+            "policy_version": policy.policy_version,
+            "policy_digest": policy.digest,
+        }
+        approval_checks, counts, quorum_errors = self._evaluate_approvals(
+            record.get("approvals", []), policy, bindings, revoked,
+            crl_version, effective_now, record.get("product", ""), as_of,
+        )
+        errors.extend(quorum_errors)
+        checks.update({"approvals": approval_checks, "approval_counts": counts,
+                       "policy_requirements": policy.requirements, "crl_version": crl_version})
+        return VerificationResult(not errors, rid, errors, checks)
+
+    def _evaluate_approvals(self, approvals, policy, bindings, revoked,
+                            crl_version, effective_now, product, as_of):
+        import base64
+
         approval_checks = []
         counted = {role: set() for role in policy.requirements}
         seen_issuers: set[str] = set()
-        import base64
-        for envelope in sorted(record.get("approvals", []), key=lambda x: x.get("approval_id", "")):
+        for envelope in sorted(approvals, key=lambda x: x.get("approval_id", "")):
             approval = envelope.get("approval", {})
             issuer_id = approval.get("issuer_id")
             key_version = approval.get("key_version")
@@ -403,22 +431,10 @@ class Verifier:
                     check["reasons"].append("approval expired")
                 if int(key_version) in revoked.get(issuer_id, []):
                     check["reasons"].append(f"revoked by CRL v{crl_version}")
-                if key.scope != approval.get("scope") or not scope_covers(key.scope, record.get("product", "")):
+                if key.scope != approval.get("scope") or not scope_covers(key.scope, product):
                     check["reasons"].append("scope mismatch")
                 if key.role != approval.get("role"):
                     check["reasons"].append("role mismatch")
-            bindings = {
-                "candidate_id": candidate.get("candidate_id"),
-                "candidate_digest": candidate.get("candidate_digest"),
-                "release_id": record.get("release_id"),
-                "product": record.get("product"),
-                "version": record.get("version"),
-                "artifact_digest": record.get("artifact_digest"),
-                "build_spec_digest": record.get("build_spec_digest"),
-                "policy_id": policy.policy_id,
-                "policy_version": policy.policy_version,
-                "policy_digest": policy.digest,
-            }
             for field_name, expected in bindings.items():
                 if approval.get(field_name) != expected:
                     check["reasons"].append(f"approval binding mismatch: {field_name}")
@@ -434,11 +450,127 @@ class Verifier:
             seen_issuers.add(issuer_id)
             approval_checks.append(check)
         counts = {role: len(issuers) for role, issuers in counted.items()}
-        checks.update({"approvals": approval_checks, "approval_counts": counts,
-                       "policy_requirements": policy.requirements, "crl_version": crl_version})
+        errors = []
         for role, required in policy.requirements.items():
             if counts.get(role, 0) < required:
                 errors.append(f"insufficient valid distinct issuers for role {role}: have {counts.get(role, 0)}, need {required}")
+        return approval_checks, counts, errors
+
+    def verify_set_release(
+        self,
+        record: dict,
+        *,
+        member_files: dict | None = None,
+        now: str,
+        as_of: str = "current",
+    ) -> VerificationResult:
+        """Verify a whole release set offline.
+
+        member_files maps product -> (artifact_path, build_spec_path).
+        Members missing from the mapping are reported as exactly which
+        trusted basis is absent, so an offline receiver learns what is
+        still needed. The approval quorum is re-interpreted under the
+        trust conditions at "now" (or at release time with
+        as_of="release").
+        """
+        from .publisher import check_dependencies, compute_set_digest
+
+        errors: list[str] = []
+        checks: dict = {}
+        rid = record.get("set_id", "?")
+        candidate = record.get("candidate", {})
+        try:
+            policy = ReleasePolicy.from_dict(record.get("policy", candidate.get("policy", {})))
+        except Exception as exc:
+            return VerificationResult(False, rid, [f"invalid release policy: {exc}"], {})
+        policy_data = policy.to_dict()
+        if candidate.get("policy") != policy_data or record.get("policy") != policy_data:
+            errors.append("policy mismatch: release set and candidate policies differ")
+        if record.get("policy_digest") != policy.digest or candidate.get("policy_digest") != policy.digest:
+            errors.append("policy digest mismatch")
+        members = record.get("members", [])
+        expected_digest = compute_set_digest(
+            record.get("name", candidate.get("name", "")),
+            record.get("set_version", candidate.get("set_version", "")),
+            members, policy_data, candidate.get("nonce", ""),
+        )
+        digest_ok = (
+            record.get("set_digest") == expected_digest
+            and candidate.get("set_digest") == expected_digest
+        )
+        checks["set_digest"] = {"expected": expected_digest,
+                                "actual": record.get("set_digest"), "ok": digest_ok}
+        if not digest_ok:
+            errors.append("set digest mismatch: members or dependency "
+                          "declarations were altered after approval")
+        dep_errors, cycles = check_dependencies(members)
+        errors.extend(dep_errors)
+        checks["dependency_cycles"] = cycles
+        checks["dependencies_ok"] = not dep_errors
+
+        member_checks = {}
+        files = member_files or {}
+        for m in members:
+            product = m["product"]
+            entry = {"artifact_digest": m["artifact_digest"],
+                     "build_spec_digest": m["build_spec_digest"],
+                     "depends_on": list(m.get("depends_on", [])),
+                     "ok": True}
+            paths = files.get(product)
+            if paths is None:
+                entry["missing"] = True
+                entry["ok"] = False
+                errors.append(
+                    f"missing trusted basis: no artifact provided for set "
+                    f"member {product} {m['version']}"
+                )
+            else:
+                art_path, spec_path = paths
+                if not os.path.exists(art_path):
+                    entry["missing"] = True
+                    entry["ok"] = False
+                    errors.append(
+                        f"missing trusted basis: artifact file for member "
+                        f"{product} not found at {art_path}"
+                    )
+                else:
+                    actual = file_digest(art_path)
+                    entry["actual_artifact_digest"] = actual
+                    if actual != m["artifact_digest"]:
+                        entry["ok"] = False
+                        errors.append(
+                            f"member {product}: artifact content mismatch "
+                            "(content substituted)"
+                        )
+                    elif spec_path is not None and os.path.exists(spec_path):
+                        actual_spec = file_digest(spec_path)
+                        entry["actual_build_spec_digest"] = actual_spec
+                        if actual_spec != m["build_spec_digest"]:
+                            entry["ok"] = False
+                            errors.append(f"member {product}: build spec mismatch")
+            member_checks[product] = entry
+        checks["members"] = member_checks
+
+        effective_now = record.get("released_at", now) if as_of == "release" else now
+        revoked, crl_version = self._crl_for(record, effective_now, as_of, errors)
+        bindings = {
+            "set_id": record.get("set_id"),
+            "set_digest": record.get("set_digest"),
+            "name": record.get("name"),
+            "set_version": record.get("set_version"),
+            "member_digests": [m["artifact_digest"] for m in members],
+            "policy_id": policy.policy_id,
+            "policy_version": policy.policy_version,
+            "policy_digest": policy.digest,
+        }
+        approval_checks, counts, quorum_errors = self._evaluate_approvals(
+            record.get("approvals", []), policy, bindings, revoked,
+            crl_version, effective_now, "", as_of,
+        )
+        errors.extend(quorum_errors)
+        checks.update({"approvals": approval_checks, "approval_counts": counts,
+                       "policy_requirements": policy.requirements,
+                       "crl_version": crl_version})
         return VerificationResult(not errors, rid, errors, checks)
 
 
