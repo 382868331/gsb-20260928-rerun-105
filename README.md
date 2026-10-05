@@ -169,6 +169,28 @@ python -m trusted_release --home store collection-compare \
 完整演示（共享依赖、循环依赖、单个制品替换）见
 `examples/demo_collection_compare.sh`。
 
+## 发布集合兼容升级组合（Collection Upgrade Planning）
+
+`trusted_release.upgrade.plan_collection_upgrade()` 从若干候选制品版本
+与用户指定的目标能力出发，寻找可以作为一份集合整体发布的组合：
+
+- **全局单版本约束**：同一产品在一份集合中只占一个实际版本；多个目标依赖
+  同一共享依赖时，所有版本范围取交集，不能按遍历顺序分别挑选。
+- **循环共同约束**：循环依赖中的每条边都会向同一个版本槽位增加约束；
+  只有整个候选闭合图同时满足范围和互斥条件才算技术兼容。
+- **双目标比较**：输出方案按“覆盖目标数量最多”优先，并同时记录相对当前
+  集合的改动成员数和最小改动方案，便于审批人比较取舍。
+- **预览双结论**：`technically_compatible` 只表示版本范围与互斥条件满足；
+  `approvals_complete` 另行表示绑定该具体候选的当前有效批准是否齐全。
+- **确认时复核**：`Publisher.confirm_collection_upgrade()` 会从方案中的
+  spec、policy、nonce 重建候选摘要，并重新执行集合验证；其他候选的批准、
+  过期/撤销/轮换密钥签发的批准都不能发布。
+- **已发布集合原样保留**：同一集合发布 ID 已存在时，确认操作返回原记录，
+  不复制、不改写也不重新索引。
+
+若全部目标没有共同解，规划结果会在 `infeasible` 中列出共享依赖范围冲突和
+互斥原因，同时仍给出仅覆盖单个目标的可行方案。
+
 
 `trusted_release/ed25519.py` 为 RFC 8032 Ed25519 纯标准库实现，
 已通过 RFC 8032 测试向量并与系统 OpenSSL 做签名互操作校验。

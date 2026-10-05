@@ -223,6 +223,80 @@ class Publisher:
         return (dt + datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # ---------- release collections ----------
+    def preview_collection_upgrade(
+        self,
+        *,
+        name: str,
+        version: str,
+        artifacts: list[dict],
+        targets: list[dict | str],
+        policy: "dict | ReleasePolicy",
+        now: str,
+        current: dict | None = None,
+        available_approvals: list[dict] | None = None,
+    ) -> dict:
+        from .upgrade import plan_collection_upgrade
+        from .verifier import Verifier
+
+        plan = plan_collection_upgrade(
+            name=name, version=version, artifacts=artifacts,
+            targets=targets, policy=policy, now=now, current=current,
+            available_approvals=available_approvals or [],
+        )
+        if self.crl is None:
+            return plan
+
+        policy_obj = (
+            policy if isinstance(policy, ReleasePolicy)
+            else ReleasePolicy.from_dict(policy)
+        )
+        verifier = Verifier(self.keystore, self.crl)
+        for option in plan["options"]:
+            candidate = option["candidate"]
+            record = {
+                "type": "trusted-release/collection/v1",
+                "collection_release_id": candidate["collection_release_id"],
+                "candidate": candidate,
+                "name": candidate["name"],
+                "version": candidate["version"],
+                "spec": candidate["spec"],
+                "spec_digest": candidate["spec_digest"],
+                "policy": policy_obj.to_dict(),
+                "policy_digest": policy_obj.digest,
+                "approvals": list(available_approvals or []),
+                "released_at": now,
+            }
+            current_crl = self.crl.read_current()
+            if current_crl is not None:
+                record["crl_version_at_release"] = current_crl["body"]["crl_version"]
+            result = verifier.verify_collection(
+                record,
+                resolve_content=lambda digest: None,
+                now=now,
+                as_of="release",
+            )
+            counts = result.checks.get("approval_counts", {})
+            invalid = [
+                {
+                    "approval_id": check.get("approval_id"),
+                    "issuer": check.get("issuer"),
+                    "role": check.get("role"),
+                    "reasons": check.get("reasons", []),
+                }
+                for check in result.checks.get("approvals", [])
+                if not check.get("ok")
+            ]
+            missing = {
+                role: required
+                for role, required in policy_obj.requirements.items()
+                if counts.get(role, 0) < required
+            }
+            option["approval_counts"] = dict(counts)
+            option["missing_approval_roles"] = missing
+            option["approvals_complete"] = not missing
+            option["invalid_approvals"] = invalid
+        return plan
+
     def create_collection_candidate(
         self,
         *,
@@ -353,3 +427,71 @@ class Publisher:
         )
         self.registry.index_collection(record)
         return record
+
+    def confirm_collection_upgrade(
+        self,
+        plan: dict,
+        approvals: list[dict],
+        *,
+        now: str,
+        option_id: str | None = None,
+    ) -> dict:
+        """Publish the selected upgrade option after a fresh trust check.
+
+        The preview never grants publish authority. At confirmation the
+        stored candidate digest is rebuilt from the option spec/policy/nonce,
+        and finalize_collection rechecks content, signatures, key status, CRL
+        state and policy quorum against current data.
+        """
+        from . import collection as coll
+
+        options = plan.get("options", [])
+        if option_id is None:
+            compatible = [o for o in options if o.get("technically_compatible")]
+            if not compatible:
+                raise ValueError("upgrade plan has no technically compatible option")
+            option = compatible[0]
+        else:
+            matches = [o for o in options if o.get("option_id") == option_id]
+            if not matches:
+                raise ValueError(f"upgrade option not found: {option_id}")
+            option = matches[0]
+        if not option.get("technically_compatible"):
+            raise ValueError("selected upgrade option is not technically compatible")
+
+        candidate = option.get("candidate", {})
+        policy = ReleasePolicy.from_dict(candidate.get("policy", {}))
+        spec = candidate.get("spec", {})
+        members_by_key = {
+            (member.get("product"), member.get("version")): member
+            for member in spec.get("members", [])
+        }
+        for key, source in option.get("content_sources", {}).items():
+            product, _, item_version = key.partition(":")
+            member = members_by_key.get((product, item_version), {})
+            manifest = self.registry.register_artifact(
+                source_path=source["artifact_path"],
+                product=product,
+                version=item_version,
+                build_spec_path=source["build_spec_path"],
+                now=candidate.get("created_at", now),
+            )
+            if manifest["artifact_digest"] != member.get("artifact_digest"):
+                raise ValueError("upgrade option artifact changed after preview")
+            if manifest["build_spec_digest"] != member.get("build_spec_digest"):
+                raise ValueError("upgrade option build spec changed after preview")
+        rebuilt = coll.build_candidate(
+            spec=spec,
+            policy=policy,
+            now=candidate.get("created_at", now),
+            nonce=candidate.get("nonce"),
+        )
+        if rebuilt["candidate_digest"] != candidate.get("candidate_digest"):
+            raise ValueError("upgrade option version data changed after preview")
+
+        index = self.registry.read_index()
+        for entry in index.get("collections", []):
+            if entry["collection_release_id"] == rebuilt["collection_release_id"]:
+                return self.registry.read_collection(entry["collection_release_id"])
+
+        return self.finalize_collection(rebuilt, approvals, now=now)
