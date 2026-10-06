@@ -142,6 +142,59 @@ python -m trusted_release --home store collection-list
 集合记录存储在 `registry/collections/<collection_release_id>.json`，
 目录条目追加在 `index.json` 的 `collections` 列表中。
 
+## 发布集合兼容升级组合选择（Upgrade Planning）
+
+审批人员面对同一产品的多个候选制品版本时，不应按依赖遍历顺序贪心拼装。
+兼容升级规划把整个集合视为一个全局约束问题：
+
+- **共享依赖只有一份实际版本**：同一产品在候选组合中只能选择一个版本，
+  所有依赖范围必须共同约束这份版本；两个目标要求互不相交流段时，
+  完整目标集合无技术可行解，但可报告覆盖目标最多的局部方案。
+- **互斥与循环依赖全局求解**：`conflicts_with` 在完整组合上检查；
+  循环依赖按共同约束处理，A/B 任一遍历起点都得到相同结论。
+- **双目标排序**：每个可行方案同时给出 `coverage_count` 与 `change_count`，
+  调用方可比较覆盖目标最多与相对当前集合改动最少的方案。
+- **预览分离两类结论**：`technical_options` 只表示版本范围、互斥与集合
+  结构技术兼容；`publish_ready_options` 还要求当前签名、密钥状态、时间窗、
+  CRL 与角色数量均通过验证。缺少批准的组合可预览但不能发布。
+- **确认时重新验证**：确认接口会重新计算集合规格与候选 digest，
+  并只提交绑定所选候选 digest 的批准；最终发布仍由 finalize 路径按当前
+  信任库和 CRL 再验证一次。属于其他候选的批准不会计入新组合。
+- **已发布集合不变**：如果预览选出的成员和策略与当前集合完全相同，
+  选项标记为 `already_published`，确认会拒绝重复发布，原集合记录和索引保持原样。
+
+核心 API：
+
+```python
+plan = publisher.preview_collection_upgrade(
+    name="platform",
+    version="2026.11",
+    current_collection=old_record,
+    policy=ReleasePolicy("standard", 1, {"build": 1, "qa": 1}),
+    targets=[("app", "2.1")],
+    candidates=[{
+        "product": "app",
+        "version": "2.1",
+        "artifact_path": "app-2.1.tar",
+        "build_spec_path": "APP.BUILD",
+        "requires": [{"product": "lib", "specifier": ">=1.0,<2.0"}],
+        "conflicts_with": [{"product": "plugin", "specifier": "<1.2"}],
+    }],
+    now=now,
+)
+record = publisher.confirm_collection_upgrade(
+    plan,
+    selection_id=plan["recommended"]["id"],
+    approvals=approvals_for_selected_candidate,
+    now=confirm_time,
+)
+```
+
+候选也可以只提供已登记的 `artifact_digest` / `build_spec_digest` 与版本约束，
+因此规划过程可完全离线进行。纯规划入口为
+`trusted_release.upgrade.plan_compatible_upgrade()`；发布器入口额外负责构造确定性
+候选、判断批准归属并执行最终发布校验。
+
 ## 发布集合版本对照报告（Collection Compare）
 
 审批人员选择两个已发布集合，`collection-compare` 生成一份自包含、可离线

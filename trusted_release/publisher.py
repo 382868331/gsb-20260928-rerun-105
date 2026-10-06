@@ -353,3 +353,213 @@ class Publisher:
         )
         self.registry.index_collection(record)
         return record
+
+    # ---------- compatible collection upgrades ----------
+    def preview_collection_upgrade(
+        self,
+        *,
+        name: str,
+        version: str,
+        candidates: list[dict],
+        targets: list,
+        policy: "dict | ReleasePolicy",
+        now: str,
+        current_collection: dict | None = None,
+        available_approvals: list[dict] | None = None,
+    ) -> dict:
+        """Build and classify all globally feasible collection upgrades."""
+        from . import collection as coll
+        from . import upgrade
+        from .verifier import Verifier
+
+        policy_obj = (
+            policy if isinstance(policy, ReleasePolicy)
+            else ReleasePolicy.from_dict(policy)
+        )
+        resolved_candidates = []
+        for candidate in candidates:
+            entry = {
+                "product": str(candidate["product"]),
+                "version": str(candidate["version"]),
+                "requires": upgrade._requirements(candidate),
+                "conflicts_with": upgrade._conflicts(candidate),
+            }
+            if "artifact_path" in candidate:
+                manifest = self.registry.register_artifact(
+                    source_path=candidate["artifact_path"],
+                    product=entry["product"],
+                    version=entry["version"],
+                    build_spec_path=candidate["build_spec_path"],
+                    now=now,
+                )
+                entry["artifact_digest"] = manifest["artifact_digest"]
+                entry["build_spec_digest"] = manifest["build_spec_digest"]
+            else:
+                entry["artifact_digest"] = candidate["artifact_digest"]
+                entry["build_spec_digest"] = candidate["build_spec_digest"]
+            resolved_candidates.append(entry)
+
+        current_members = None
+        current_policy = None
+        current_approvals = []
+        if current_collection is not None:
+            current_members = current_collection.get(
+                "spec", current_collection.get("candidate", {}).get("spec", {})
+            ).get("members", [])
+            current_policy = ReleasePolicy.from_dict(current_collection.get("policy", {}))
+            current_approvals = list(current_collection.get("approvals", []))
+
+        plan = upgrade.plan_compatible_upgrade(
+            candidates=resolved_candidates,
+            targets=targets,
+            current_members=current_members,
+        )
+        approvals = list(current_approvals)
+        approvals.extend(available_approvals or [])
+
+        for option in plan["options"]:
+            spec = coll.build_spec(
+                name=name, version=version, members=option["members"])
+            nonce_material = canonical_hash({
+                "purpose": "collection-upgrade-selection",
+                "spec": spec,
+                "policy": policy_obj.to_dict(),
+            })
+            candidate_record = coll.build_candidate(
+                spec=spec,
+                policy=policy_obj,
+                now=now,
+                nonce=nonce_material.split(":", 1)[1],
+            )
+            option["candidate"] = candidate_record
+            option["approval_state"] = {
+                "approvals_complete": False,
+                "ready_to_publish": False,
+                "valid_counted": {},
+                "missing_roles": [],
+                "errors": [],
+            }
+
+            unchanged_current = bool(
+                current_collection is not None
+                and current_policy == policy_obj
+                and current_collection.get("spec_digest") == candidate_record["spec_digest"]
+            )
+            if unchanged_current:
+                option["candidate"] = current_collection.get("candidate", candidate_record)
+                option["already_published"] = True
+                option["approval_state"] = {
+                    "approvals_complete": True,
+                    "ready_to_publish": False,
+                    "valid_counted": {},
+                    "missing_roles": [],
+                    "errors": ["selected combination is already published; it remains unchanged"],
+                }
+                continue
+
+            draft = {
+                "type": coll.RELEASE_TYPE,
+                "collection_release_id": candidate_record["collection_release_id"],
+                "candidate": candidate_record,
+                "candidate_id": candidate_record["candidate_id"],
+                "candidate_digest": candidate_record["candidate_digest"],
+                "name": name,
+                "version": version,
+                "spec": spec,
+                "spec_digest": candidate_record["spec_digest"],
+                "policy": policy_obj.to_dict(),
+                "policy_digest": policy_obj.digest,
+                "approvals": approvals,
+                "released_at": now,
+            }
+
+            def resolve(digest: str):
+                path = self.registry.artifact_path(digest)
+                return path if self.registry.has_artifact(digest) else None
+
+            result = Verifier(self.keystore, self.crl).verify_collection(
+                draft, resolve_content=resolve, now=now, as_of="current",
+                expected_name=name,
+            )
+            missing_roles = []
+            for role, required in policy_obj.requirements.items():
+                count = result.checks.get("approval_counts", {}).get(role, 0)
+                if count < required:
+                    missing_roles.append({
+                        "role": role,
+                        "required": required,
+                        "currently_valid": count,
+                        "missing": required - count,
+                    })
+            member_errors = [
+                error for error in result.errors
+                if "insufficient valid distinct issuers" not in error
+            ]
+            option["already_published"] = False
+            option["approval_state"] = {
+                "approvals_complete": result.ok,
+                "ready_to_publish": result.ok and option["technically_compatible"],
+                "valid_counted": result.checks.get("approval_counts", {}),
+                "missing_roles": missing_roles,
+                "errors": member_errors,
+            }
+
+        plan["name"] = name
+        plan["collection_version"] = version
+        plan["policy"] = policy_obj.to_dict()
+        plan["technical_options"] = [
+            option["id"] for option in plan["options"]
+            if option["technically_compatible"]
+        ]
+        plan["publish_ready_options"] = [
+            option["id"] for option in plan["options"]
+            if option["approval_state"]["ready_to_publish"]
+        ]
+        return plan
+
+    def confirm_collection_upgrade(
+        self,
+        plan: dict,
+        *,
+        selection_id: str,
+        approvals: list[dict],
+        now: str,
+    ) -> dict:
+        """Re-validate a previewed selection and publish only with current approvals."""
+        selected = next(
+            (option for option in plan.get("options", [])
+             if option.get("id") == selection_id),
+            None,
+        )
+        if selected is None:
+            raise ValueError(f"unknown upgrade selection {selection_id!r}")
+        if not selected.get("technically_compatible"):
+            raise ValueError("selected combination is not technically compatible")
+        if selected.get("already_published"):
+            raise ValueError("selected collection is already published and remains unchanged")
+        candidate = selected.get("candidate")
+        if not candidate:
+            raise ValueError("upgrade plan does not contain a buildable candidate")
+        policy = ReleasePolicy.from_dict(plan.get("policy", candidate.get("policy")))
+        from . import collection as coll
+
+        expected_spec = coll.build_spec(
+            name=plan["name"],
+            version=plan["collection_version"],
+            members=selected["members"],
+        )
+        if coll.spec_digest(expected_spec) != candidate.get("spec_digest"):
+            raise ValueError("upgrade member versions changed before confirmation")
+        rebuilt_digest = canonical_hash({
+            "spec": expected_spec,
+            "policy": policy.to_dict(),
+            "nonce": candidate["nonce"],
+        })
+        if rebuilt_digest != candidate["candidate_digest"]:
+            raise ValueError("upgrade candidate version constraints changed before confirmation")
+        matching_approvals = [
+            envelope for envelope in approvals
+            if envelope.get("approval", envelope).get("candidate_digest")
+            == candidate["candidate_digest"]
+        ]
+        return self.finalize_collection(candidate, matching_approvals, now=now)
